@@ -1,0 +1,17 @@
+cred.txt
+my_clawbot_key.pem
+
+# Local environments and generated Python artifacts
+.venv/
+**/__pycache__/
+*.py[cod]
+
+# Rust build output
+rust_api/target/
+
+# Logs and local backups
+*.log
+rust_api/.git.backup/
+
+# Model artifacts that exceed normal GitHub file limits
+*.gguf
