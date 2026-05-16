@@ -14,4 +14,5 @@ rust_api/target/
 rust_api/.git.backup/
 
 # Model artifacts that exceed normal GitHub file limits
+/SmolLM2-135M-Instruct.Q4_K_M.gguf
 *.gguf
