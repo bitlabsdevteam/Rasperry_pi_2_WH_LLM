@@ -1,6 +1,6 @@
 use ai_assistant::{
     adapters::storage::SqliteStore,
-    config::{AssistantPaths, MemoryConfig, SchedulerConfig},
+    config::{AssistantPaths, LlmConfig, MemoryConfig, SchedulerConfig},
     core::{
         context::maybe_compact,
         memory::record_turn,
@@ -21,15 +21,30 @@ fn long_conversation_stress_keeps_recent_context() {
         compact_after_turns: 20,
         retain_recent_turns: 6,
         token_budget: 160,
+        compact_context_threshold_percent: 70,
         memory_search_limit: 4,
         memory_ttl_days: 30,
+    };
+    let llm = LlmConfig {
+        prefer_http: false,
+        endpoint: String::new(),
+        health_endpoint: String::new(),
+        model: "mock".into(),
+        binary_path: String::new(),
+        model_path: String::new(),
+        threads: 1,
+        context_size: 1024,
+        predict_tokens: 64,
+        timeout_secs: 1,
+        retries: 0,
+        stream: false,
     };
 
     for turn in 0..24 {
         record_turn(&paths, &store, "default", "user", &format!("turn {turn}")).unwrap();
     }
 
-    let outcome = maybe_compact(&paths, &store, "default", &memory).unwrap();
+    let outcome = maybe_compact(&paths, &store, "default", &memory, &llm).unwrap();
     assert!(outcome.unwrap().contains("compacted"));
 }
 
@@ -44,8 +59,23 @@ fn low_memory_simulation_uses_small_token_budget() {
         compact_after_turns: 4,
         retain_recent_turns: 2,
         token_budget: 48,
+        compact_context_threshold_percent: 70,
         memory_search_limit: 2,
         memory_ttl_days: 30,
+    };
+    let llm = LlmConfig {
+        prefer_http: false,
+        endpoint: String::new(),
+        health_endpoint: String::new(),
+        model: "mock".into(),
+        binary_path: String::new(),
+        model_path: String::new(),
+        threads: 1,
+        context_size: 1024,
+        predict_tokens: 64,
+        timeout_secs: 1,
+        retries: 0,
+        stream: false,
     };
 
     for turn in 0..4 {
@@ -60,7 +90,7 @@ fn low_memory_simulation_uses_small_token_budget() {
     }
 
     assert!(
-        maybe_compact(&paths, &store, "default", &memory)
+        maybe_compact(&paths, &store, "default", &memory, &llm)
             .unwrap()
             .is_some()
     );

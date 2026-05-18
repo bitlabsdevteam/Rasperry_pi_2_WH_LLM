@@ -11,10 +11,11 @@ use std::{
 use crate::{
     adapters::storage::SqliteStore,
     config::{
-        AppConfig, AssistantPaths, LlmConfig, TelegramConfig, resolve_profile_path,
-        write_llm_config, write_telegram_config,
+        AppConfig, AssistantPaths, IdentityConfig, LlmConfig, TelegramConfig,
+        write_identity_config, write_llm_config, write_telegram_config,
     },
     core::{
+        identity::{UserProfile, write_assistant_profile},
         memory::{search_memories, summarize_session},
         rag,
         scheduler::{add_job, list_jobs, run_due_jobs},
@@ -27,19 +28,9 @@ use crate::{
             session_key,
         },
         tools::{ToolExecutor, add_tool, remove_tool},
+        voice::{DEFAULT_VOICE_SESSION, doctor_voice, run_voice_turn},
     },
-    util::read_to_string,
 };
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct OnboardingUserProfile {
-    name: String,
-    telegram_handle: String,
-    role: String,
-    about: String,
-    goals: String,
-    preferences: String,
-}
 
 pub fn run_from_env() -> Result<(), String> {
     let args = env::args().collect::<Vec<_>>();
@@ -91,6 +82,7 @@ pub fn run(args: Vec<String>, paths: AssistantPaths) -> Result<String, String> {
         "rag" => run_rag(&args[2..], &store),
         "serve" => run_serve(&args[2..], &paths, &store, &config, &tools),
         "telegram" => run_telegram_command(&args[2..], &paths, &store, &config),
+        "voice" => run_voice_command(&args[2..], &paths, &store, &config),
         "doctor" => run_doctor(&paths, &config),
         "onboard" => run_onboard(&args[2..], &paths),
         "help" | "--help" | "-h" => render_help_text(&paths, &config, &store),
@@ -651,6 +643,128 @@ fn run_telegram_command(
     }
 }
 
+fn run_voice_command(
+    args: &[String],
+    paths: &AssistantPaths,
+    store: &SqliteStore,
+    config: &AppConfig,
+) -> Result<String, String> {
+    match args.first().map(String::as_str) {
+        Some("run") => {
+            if !args.iter().any(|arg| arg == "--once") {
+                return Err("voice run supports: --once".to_string());
+            }
+            let session =
+                value_after_flag(args, "--session").unwrap_or_else(|| DEFAULT_VOICE_SESSION.into());
+            let output = run_voice_turn(paths, config, store, &session)?;
+            Ok(render_voice_turn_output(&output))
+        }
+        Some("serve") => run_voice_serve(&args[1..], paths, store, config),
+        Some("doctor") => Ok(render_voice_doctor(paths, config)),
+        _ => Err("voice supports: run --once | serve | doctor".to_string()),
+    }
+}
+
+fn run_voice_serve(
+    args: &[String],
+    paths: &AssistantPaths,
+    store: &SqliteStore,
+    config: &AppConfig,
+) -> Result<String, String> {
+    let session =
+        value_after_flag(args, "--session").unwrap_or_else(|| DEFAULT_VOICE_SESSION.into());
+    let iterations = value_after_flag(args, "--iterations")
+        .map(|value| {
+            value
+                .parse::<usize>()
+                .map_err(|_| "--iterations must be numeric".to_string())
+        })
+        .transpose()?;
+    let mut completed = 0usize;
+    loop {
+        wait_for_voice_trigger(config)?;
+        let output = run_voice_turn(paths, config, store, &session)?;
+        println!("{}", render_voice_turn_output(&output));
+        completed += 1;
+        if iterations.is_some_and(|limit| completed >= limit) {
+            return Ok(format!("voice serve completed {completed} turn(s)"));
+        }
+    }
+}
+
+fn wait_for_voice_trigger(config: &AppConfig) -> Result<(), String> {
+    let command = config.voice.push_to_talk_command.trim();
+    if !command.is_empty() {
+        let mut parts = command.split_whitespace();
+        let executable = parts
+            .next()
+            .ok_or_else(|| "push_to_talk_command is empty".to_string())?;
+        let output = Command::new(executable)
+            .args(parts)
+            .output()
+            .map_err(|error| format!("failed to run push_to_talk_command: {error}"))?;
+        if output.status.success() {
+            return Ok(());
+        }
+        return Err(format!(
+            "push_to_talk_command failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    println!("Press Enter to capture a voice turn.");
+    let mut buffer = String::new();
+    io::stdin()
+        .read_line(&mut buffer)
+        .map_err(|error| format!("failed to read push-to-talk input: {error}"))?;
+    Ok(())
+}
+
+fn render_voice_turn_output(output: &crate::core::voice::VoiceTurnOutput) -> String {
+    let mut lines = vec![format!("voice session: {}", output.session)];
+    if output.skipped {
+        lines.push("voice turn skipped: empty transcript".to_string());
+    }
+    if let Some(transcript) = &output.transcript {
+        lines.push(format!("transcript: {transcript}"));
+    }
+    if let Some(response) = &output.response {
+        lines.push(format!("assistant: {response}"));
+    }
+    if let Some(path) = &output.input_audio_path {
+        lines.push(format!("input audio: {}", path.display()));
+    }
+    if let Some(path) = &output.output_audio_path {
+        lines.push(format!("reply audio: {}", path.display()));
+    }
+    for error in &output.errors {
+        lines.push(format!("voice warning: {error}"));
+    }
+    lines.join("\n")
+}
+
+fn render_voice_doctor(paths: &AssistantPaths, config: &AppConfig) -> String {
+    let mut lines = vec![
+        "Voice doctor report".to_string(),
+        format!("voice enabled: {}", config.voice.enabled),
+        format!("trigger mode: {}", config.voice.trigger_mode),
+    ];
+    lines.extend(
+        doctor_voice(paths, &config.voice)
+            .into_iter()
+            .map(|(name, ok)| check_line(&name, ok)),
+    );
+    lines.push(format!(
+        "input device: {}",
+        empty_as_default(&config.voice.input_device)
+    ));
+    lines.push(format!(
+        "output device: {}",
+        empty_as_default(&config.voice.output_device)
+    ));
+    lines.join("\n")
+}
+
 fn run_doctor(paths: &AssistantPaths, config: &AppConfig) -> Result<String, String> {
     let mut lines = vec!["Doctor report".to_string()];
     lines.push(check_line("config/", writable_dir(&paths.config_dir)));
@@ -665,6 +779,9 @@ fn run_doctor(paths: &AssistantPaths, config: &AppConfig) -> Result<String, Stri
         "GGUF model path",
         Path::new(&config.llm.model_path).exists(),
     ));
+
+    lines.push(String::new());
+    lines.push(render_voice_doctor(paths, config));
 
     let token_state = match config.telegram.resolve_bot_token(paths)? {
         Some(token) => {
@@ -694,12 +811,56 @@ fn run_doctor(paths: &AssistantPaths, config: &AppConfig) -> Result<String, Stri
 
 fn run_onboard(args: &[String], paths: &AssistantPaths) -> Result<String, String> {
     match args.first().map(String::as_str) {
+        None | Some("identity") => {
+            run_identity_onboarding_wizard(paths)?;
+            Ok("identity onboarding complete".to_string())
+        }
         Some("telegram") => {
             run_telegram_onboarding_wizard(paths)?;
             Ok("telegram onboarding complete".to_string())
         }
-        _ => Err("onboard supports: telegram".to_string()),
+        _ => Err("onboard supports: identity | telegram".to_string()),
     }
+}
+
+fn run_identity_onboarding_wizard(paths: &AssistantPaths) -> Result<(), String> {
+    let current = AppConfig::load(paths)?;
+
+    println!("Identity onboarding");
+    println!();
+    println!("Set the assistant identity and the user profile stored locally on this Pi.");
+    println!("Press Enter to keep a default value or leave an optional field blank.");
+    println!();
+
+    let identity = IdentityConfig {
+        name: prompt_line_with_default("Assistant name", &current.identity.name)?,
+        style: prompt_line_with_default("Assistant reply style", &current.identity.style)?,
+        system_instruction: current.identity.system_instruction.clone(),
+    };
+    let user = UserProfile {
+        name: prompt_line_with_default("Your name", "User")?,
+        telegram_handle: prompt_line("Telegram / handle (optional): ")?,
+        role: prompt_line("Role / what you do (optional): ")?,
+        about: prompt_line("What should the assistant know about you? (optional): ")?,
+        goals: prompt_line("Current goals or active projects (optional): ")?,
+        preferences: prompt_line_with_default(
+            "Preferred reply style",
+            "direct, concise, practical",
+        )?,
+    };
+
+    write_identity_onboarding(paths, &identity, &user)?;
+    println!("Updated config/identity.json and data/profiles/assistant.md.");
+    Ok(())
+}
+
+fn write_identity_onboarding(
+    paths: &AssistantPaths,
+    identity: &IdentityConfig,
+    user: &UserProfile,
+) -> Result<(), String> {
+    write_identity_config(paths, identity)?;
+    write_assistant_profile(paths, identity, user)
 }
 
 fn run_telegram_onboarding_wizard(paths: &AssistantPaths) -> Result<(), String> {
@@ -778,11 +939,9 @@ fn run_telegram_onboarding_wizard(paths: &AssistantPaths) -> Result<(), String> 
     println!("Tell the assistant about you so it can answer personal context questions correctly.");
     println!("Press Enter to keep a default value or skip an optional field.");
     let user_profile = collect_onboarding_user_profile(&approved)?;
-    write_onboarding_user_profile(paths, &user_profile)?;
-    println!(
-        "Updated {} with your user profile.",
-        resolve_profile_path(paths).display()
-    );
+    let current = AppConfig::load(paths)?;
+    write_assistant_profile(paths, &current.identity, &user_profile)?;
+    println!("Updated the assistant profile with your user details.");
 
     let onboarded = AppConfig::load(paths)?;
     let outcome = run_chat_session(
@@ -857,18 +1016,26 @@ fn render_help_text(
         if onboarding_complete(config) {
             "assistant serve".to_string()
         } else {
-            "assistant onboard telegram".to_string()
+            "assistant onboard".to_string()
         },
+        "assistant onboard telegram".to_string(),
         "assistant doctor".to_string(),
         "assistant telegram status".to_string(),
+        "assistant voice doctor".to_string(),
+        "assistant voice run --once".to_string(),
         String::new(),
         "Commands:".to_string(),
         "assistant chat --message <text> [--session <id>] [--stream]".to_string(),
+        "assistant onboard".to_string(),
+        "assistant onboard identity".to_string(),
         "assistant onboard telegram".to_string(),
         "assistant telegram status".to_string(),
         "assistant telegram pending".to_string(),
         "assistant telegram approve <code>".to_string(),
         "assistant telegram deny <code>".to_string(),
+        "assistant voice run --once [--session <id>]".to_string(),
+        "assistant voice serve [--session <id>] [--iterations N]".to_string(),
+        "assistant voice doctor".to_string(),
         "assistant doctor".to_string(),
         "assistant search <query>".to_string(),
         "assistant ingest <path>".to_string(),
@@ -906,7 +1073,7 @@ fn render_help_text(
 fn onboarding_needed_text() -> String {
     [
         "Onboarding: pending",
-        "Run `assistant onboard telegram` or start `assistant` without arguments in an interactive terminal to launch the Telegram setup wizard.",
+        "Run `assistant onboard` for local identity onboarding or `assistant onboard telegram` for the Telegram setup wizard.",
     ]
     .join("\n")
 }
@@ -1020,6 +1187,14 @@ fn check_line(name: &str, ok: bool) -> String {
     format!("{name}: {}", if ok { "ok" } else { "missing" })
 }
 
+fn empty_as_default(value: &str) -> &str {
+    if value.trim().is_empty() {
+        "default"
+    } else {
+        value
+    }
+}
+
 fn prompt_line(prompt: &str) -> Result<String, String> {
     print!("{prompt}");
     io::stdout()
@@ -1055,7 +1230,7 @@ fn prompt_yes_no(prompt: &str, default_yes: bool) -> Result<bool, String> {
 
 fn collect_onboarding_user_profile(
     approved: &crate::core::telegram::PendingPairing,
-) -> Result<OnboardingUserProfile, String> {
+) -> Result<UserProfile, String> {
     let default_name = if !approved.first_name.trim().is_empty() {
         approved.first_name.trim().to_string()
     } else if !approved.username.trim().is_empty() {
@@ -1070,7 +1245,7 @@ fn collect_onboarding_user_profile(
     let goals = prompt_line("Current goals or active projects (optional): ")?;
     let preferences = prompt_line_with_default("Preferred reply style", default_preferences)?;
 
-    Ok(OnboardingUserProfile {
+    Ok(UserProfile {
         name,
         telegram_handle: if approved.username.trim().is_empty() {
             String::new()
@@ -1082,53 +1257,6 @@ fn collect_onboarding_user_profile(
         goals,
         preferences,
     })
-}
-
-fn write_onboarding_user_profile(
-    paths: &AssistantPaths,
-    profile: &OnboardingUserProfile,
-) -> Result<(), String> {
-    let path = resolve_profile_path(paths);
-    let existing = read_to_string(&path)?;
-    fs::write(&path, upsert_user_profile_section(&existing, profile))
-        .map_err(|error| format!("failed to write {}: {error}", path.display()))
-}
-
-fn upsert_user_profile_section(existing: &str, profile: &OnboardingUserProfile) -> String {
-    let rendered = render_user_profile_section(profile);
-    let marker = "\n## User Profile\n";
-    if let Some(index) = existing.find(marker) {
-        let prefix = existing[..index].trim_end();
-        format!("{prefix}\n\n{rendered}\n")
-    } else {
-        format!("{}\n\n{rendered}\n", existing.trim_end())
-    }
-}
-
-fn render_user_profile_section(profile: &OnboardingUserProfile) -> String {
-    let mut lines = vec![
-        "## User Profile".to_string(),
-        format!("Name: {}", profile.name),
-    ];
-    if !profile.telegram_handle.is_empty() {
-        lines.push(format!("Telegram: {}", profile.telegram_handle));
-    }
-    if !profile.role.trim().is_empty() {
-        lines.push(format!("Role: {}", profile.role.trim()));
-    }
-    if !profile.about.trim().is_empty() {
-        lines.push("About:".to_string());
-        lines.push(format!("- {}", profile.about.trim()));
-    }
-    if !profile.goals.trim().is_empty() {
-        lines.push("Current goals:".to_string());
-        lines.push(format!("- {}", profile.goals.trim()));
-    }
-    if !profile.preferences.trim().is_empty() {
-        lines.push("Preferences:".to_string());
-        lines.push(format!("- {}", profile.preferences.trim()));
-    }
-    lines.join("\n")
 }
 
 fn value_after_flag(args: &[String], flag: &str) -> Option<String> {
@@ -1183,11 +1311,16 @@ mod tests {
         thread,
     };
 
-    use crate::{cli::run, config::AssistantPaths, util::unique_temp_dir};
+    use crate::{
+        cli::run,
+        config::{AssistantPaths, IdentityConfig},
+        core::identity::{UserProfile, render_assistant_profile},
+        util::unique_temp_dir,
+    };
 
     use super::{
-        OnboardingUserProfile, onboarding_complete, render_help_text, service_scheduler_interval,
-        service_telegram_timeout, upsert_user_profile_section,
+        onboarding_complete, render_help_text, service_scheduler_interval,
+        service_telegram_timeout, write_identity_onboarding,
     };
 
     #[test]
@@ -1437,15 +1570,14 @@ mod tests {
     }
 
     #[test]
-    fn user_profile_section_upsert_preserves_assistant_profile() {
-        let updated = upsert_user_profile_section(
-            "# Assistant Profile
-
-Name: Kumo
-
-Purpose:
-- Stay local",
-            &OnboardingUserProfile {
+    fn rendered_assistant_profile_includes_user_details() {
+        let updated = render_assistant_profile(
+            &IdentityConfig {
+                name: "Kumo".into(),
+                style: "direct, concise, practical".into(),
+                system_instruction: "Stay local".into(),
+            },
+            &UserProfile {
                 name: "David Bong".into(),
                 telegram_handle: "@davidb2021".into(),
                 role: "HardCoder".into(),
@@ -1461,6 +1593,40 @@ Purpose:
         assert!(updated.contains("Telegram: @davidb2021"));
         assert!(updated.contains("Role: HardCoder"));
         assert!(updated.contains("Fix the Telegram assistant"));
+    }
+
+    #[test]
+    fn write_identity_onboarding_updates_identity_and_profile_files() {
+        let root = unique_temp_dir("assistant-cli-identity-onboard");
+        let paths = AssistantPaths::new(root);
+        paths.ensure_defaults().unwrap();
+
+        write_identity_onboarding(
+            &paths,
+            &IdentityConfig {
+                name: "Ayaka".into(),
+                style: "direct, concise, practical".into(),
+                system_instruction: "Stay local".into(),
+            },
+            &UserProfile {
+                name: "HardCoder".into(),
+                telegram_handle: "@davidb2021".into(),
+                role: "Builder".into(),
+                about: "Builds local AI systems".into(),
+                goals: "Fix the assistant".into(),
+                preferences: "direct, concise, practical".into(),
+            },
+        )
+        .unwrap();
+
+        let identity = fs::read_to_string(paths.config_dir.join("identity.json")).unwrap();
+        assert!(identity.contains("\"name\": \"Ayaka\""));
+        assert!(identity.contains("direct, concise, practical"));
+
+        let profile = fs::read_to_string(paths.profiles_dir.join("assistant.md")).unwrap();
+        assert!(profile.contains("Name: Ayaka"));
+        assert!(profile.contains("## User Profile"));
+        assert!(profile.contains("Name: HardCoder"));
     }
 
     #[test]
@@ -1517,6 +1683,7 @@ Purpose:
         assert!(onboarding_complete(&config));
         let help = render_help_text(&paths, &config, &store).unwrap();
         assert!(help.contains("Onboarding: complete"));
+        assert!(help.contains("assistant onboard"));
         assert!(help.contains("assistant telegram status"));
     }
 

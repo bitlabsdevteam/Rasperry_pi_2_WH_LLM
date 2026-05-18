@@ -16,8 +16,8 @@ const LLM_EXAMPLE: &str = r#"{
   "binary_path": "/absolute/path/to/llama-cli",
   "model_path": "/absolute/path/to/model.gguf",
   "threads": 2,
-  "context_size": 1024,
-  "predict_tokens": 64,
+  "context_size": 4096,
+  "predict_tokens": 512,
   "timeout_secs": 20,
   "retries": 2,
   "stream": true
@@ -28,7 +28,8 @@ const MEMORY_EXAMPLE: &str = r#"{
   "recent_turn_limit": 8,
   "compact_after_turns": 12,
   "retain_recent_turns": 6,
-  "token_budget": 512,
+  "token_budget": 2048,
+  "compact_context_threshold_percent": 70,
   "memory_search_limit": 6,
   "memory_ttl_days": 30
 }
@@ -63,6 +64,25 @@ const TELEGRAM_EXAMPLE: &str = r#"{
   "pairing_enabled": true,
   "pairing_code_ttl_minutes": 15,
   "api_base_url": "https://api.telegram.org"
+}
+"#;
+
+const VOICE_EXAMPLE: &str = r#"{
+  "enabled": false,
+  "input_device": "",
+  "output_device": "",
+  "sample_rate": 16000,
+  "capture_seconds_max": 8,
+  "stt_binary_path": "whisper-cli",
+  "stt_model_path": "data/models/whisper.bin",
+  "tts_binary_path": "piper",
+  "tts_model_path": "data/models/piper.onnx",
+  "player_binary_path": "aplay",
+  "recorder_binary_path": "arecord",
+  "trigger_mode": "push_to_talk",
+  "push_to_talk_command": "",
+  "silence_timeout_ms": 1200,
+  "temp_audio_dir": "data/voice/tmp"
 }
 "#;
 
@@ -168,6 +188,7 @@ impl AssistantPaths {
             &self.config_dir.join("telegram.example.json"),
             TELEGRAM_EXAMPLE,
         )?;
+        write_if_missing(&self.config_dir.join("voice.example.json"), VOICE_EXAMPLE)?;
         write_if_missing(&self.profiles_dir.join("assistant.md"), PROFILE_EXAMPLE)?;
         Ok(())
     }
@@ -195,6 +216,7 @@ pub struct MemoryConfig {
     pub compact_after_turns: usize,
     pub retain_recent_turns: usize,
     pub token_budget: usize,
+    pub compact_context_threshold_percent: usize,
     pub memory_search_limit: usize,
     pub memory_ttl_days: usize,
 }
@@ -232,6 +254,25 @@ pub struct TelegramConfig {
 }
 
 #[derive(Clone, Debug)]
+pub struct VoiceConfig {
+    pub enabled: bool,
+    pub input_device: String,
+    pub output_device: String,
+    pub sample_rate: usize,
+    pub capture_seconds_max: usize,
+    pub stt_binary_path: String,
+    pub stt_model_path: String,
+    pub tts_binary_path: String,
+    pub tts_model_path: String,
+    pub player_binary_path: String,
+    pub recorder_binary_path: String,
+    pub trigger_mode: String,
+    pub push_to_talk_command: String,
+    pub silence_timeout_ms: usize,
+    pub temp_audio_dir: String,
+}
+
+#[derive(Clone, Debug)]
 pub struct AppConfig {
     pub llm: LlmConfig,
     pub memory: MemoryConfig,
@@ -239,6 +280,7 @@ pub struct AppConfig {
     pub identity: IdentityConfig,
     pub tools: ToolConfig,
     pub telegram: TelegramConfig,
+    pub voice: VoiceConfig,
 }
 
 impl AppConfig {
@@ -268,6 +310,10 @@ impl AppConfig {
             &paths.config_dir.join("telegram.json"),
             &paths.config_dir.join("telegram.example.json"),
         )?;
+        let voice = read_with_fallback(
+            &paths.config_dir.join("voice.json"),
+            &paths.config_dir.join("voice.example.json"),
+        )?;
 
         Ok(Self {
             llm: LlmConfig {
@@ -285,8 +331,8 @@ impl AppConfig {
                     .filter(|value| !value.trim().is_empty())
                     .unwrap_or_else(|| default_llama_model_path(paths)),
                 threads: parse_json_usize(&llm, "threads").unwrap_or(2),
-                context_size: parse_json_usize(&llm, "context_size").unwrap_or(1024),
-                predict_tokens: parse_json_usize(&llm, "predict_tokens").unwrap_or(64),
+                context_size: parse_json_usize(&llm, "context_size").unwrap_or(4096),
+                predict_tokens: parse_json_usize(&llm, "predict_tokens").unwrap_or(512),
                 timeout_secs: parse_json_usize(&llm, "timeout_secs").unwrap_or(20),
                 retries: parse_json_usize(&llm, "retries").unwrap_or(2),
                 stream: parse_json_bool(&llm, "stream").unwrap_or(true),
@@ -295,7 +341,12 @@ impl AppConfig {
                 recent_turn_limit: parse_json_usize(&memory, "recent_turn_limit").unwrap_or(8),
                 compact_after_turns: parse_json_usize(&memory, "compact_after_turns").unwrap_or(12),
                 retain_recent_turns: parse_json_usize(&memory, "retain_recent_turns").unwrap_or(6),
-                token_budget: parse_json_usize(&memory, "token_budget").unwrap_or(512),
+                token_budget: parse_json_usize(&memory, "token_budget").unwrap_or(2048),
+                compact_context_threshold_percent: parse_json_usize(
+                    &memory,
+                    "compact_context_threshold_percent",
+                )
+                .unwrap_or(70),
                 memory_search_limit: parse_json_usize(&memory, "memory_search_limit").unwrap_or(6),
                 memory_ttl_days: parse_json_usize(&memory, "memory_ttl_days").unwrap_or(30),
             },
@@ -334,6 +385,32 @@ impl AppConfig {
                 api_base_url: parse_json_string(&telegram, "api_base_url")
                     .unwrap_or_else(|| "https://api.telegram.org".to_string()),
             },
+            voice: VoiceConfig {
+                enabled: parse_json_bool(&voice, "enabled").unwrap_or(false),
+                input_device: parse_json_string(&voice, "input_device").unwrap_or_default(),
+                output_device: parse_json_string(&voice, "output_device").unwrap_or_default(),
+                sample_rate: parse_json_usize(&voice, "sample_rate").unwrap_or(16000),
+                capture_seconds_max: parse_json_usize(&voice, "capture_seconds_max").unwrap_or(8),
+                stt_binary_path: parse_json_string(&voice, "stt_binary_path")
+                    .unwrap_or_else(|| "whisper-cli".to_string()),
+                stt_model_path: parse_json_string(&voice, "stt_model_path")
+                    .unwrap_or_else(|| default_voice_stt_model_path(paths)),
+                tts_binary_path: parse_json_string(&voice, "tts_binary_path")
+                    .unwrap_or_else(|| "piper".to_string()),
+                tts_model_path: parse_json_string(&voice, "tts_model_path")
+                    .unwrap_or_else(|| default_voice_tts_model_path(paths)),
+                player_binary_path: parse_json_string(&voice, "player_binary_path")
+                    .unwrap_or_else(|| "aplay".to_string()),
+                recorder_binary_path: parse_json_string(&voice, "recorder_binary_path")
+                    .unwrap_or_else(|| "arecord".to_string()),
+                trigger_mode: parse_json_string(&voice, "trigger_mode")
+                    .unwrap_or_else(|| "push_to_talk".to_string()),
+                push_to_talk_command: parse_json_string(&voice, "push_to_talk_command")
+                    .unwrap_or_default(),
+                silence_timeout_ms: parse_json_usize(&voice, "silence_timeout_ms").unwrap_or(1200),
+                temp_audio_dir: parse_json_string(&voice, "temp_audio_dir")
+                    .unwrap_or_else(|| default_voice_temp_audio_dir(paths)),
+            },
         })
     }
 }
@@ -348,8 +425,8 @@ impl LlmConfig {
             binary_path: default_llama_binary_path(paths),
             model_path: default_llama_model_path(paths),
             threads: 2,
-            context_size: 1024,
-            predict_tokens: 64,
+            context_size: 4096,
+            predict_tokens: 512,
             timeout_secs: 20,
             retries: 2,
             stream: true,
@@ -398,6 +475,30 @@ pub fn default_llama_model_path(paths: &AssistantPaths) -> String {
         .parent()
         .unwrap_or(&paths.root)
         .join("SmolLM2-135M-Instruct.Q4_K_M.gguf")
+        .to_string_lossy()
+        .to_string()
+}
+
+pub fn default_voice_stt_model_path(paths: &AssistantPaths) -> String {
+    paths
+        .data_dir
+        .join("models/whisper.bin")
+        .to_string_lossy()
+        .to_string()
+}
+
+pub fn default_voice_tts_model_path(paths: &AssistantPaths) -> String {
+    paths
+        .data_dir
+        .join("models/piper.onnx")
+        .to_string_lossy()
+        .to_string()
+}
+
+pub fn default_voice_temp_audio_dir(paths: &AssistantPaths) -> String {
+    paths
+        .data_dir
+        .join("voice/tmp")
         .to_string_lossy()
         .to_string()
 }
@@ -503,6 +604,27 @@ pub fn write_tool_config(paths: &AssistantPaths, config: &ToolConfig) -> Result<
     write_config_file(
         &paths.config_dir.join("tools.json"),
         &format!("{{\n  \"allowlist\": [{}]\n}}\n", allowlist),
+    )
+}
+
+pub fn write_identity_config(
+    paths: &AssistantPaths,
+    config: &IdentityConfig,
+) -> Result<(), String> {
+    write_config_file(
+        &paths.config_dir.join("identity.json"),
+        &format!(
+            concat!(
+                "{{\n",
+                "  \"name\": \"{}\",\n",
+                "  \"style\": \"{}\",\n",
+                "  \"system_instruction\": \"{}\"\n",
+                "}}\n"
+            ),
+            escape_json_string(&config.name),
+            escape_json_string(&config.style),
+            escape_json_string(&config.system_instruction),
+        ),
     )
 }
 

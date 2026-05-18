@@ -10,8 +10,14 @@ use crate::{
         storage::SqliteStore,
         telegram::{TelegramAdapter, TelegramUpdate},
     },
-    config::{AppConfig, AssistantPaths, TelegramConfig, write_telegram_config},
-    core::service::run_chat_session,
+    config::{
+        AppConfig, AssistantPaths, IdentityConfig, TelegramConfig, write_identity_config,
+        write_telegram_config,
+    },
+    core::{
+        identity::{UserProfile, write_assistant_profile},
+        service::run_chat_session,
+    },
     util::{now_epoch, sql_escape},
 };
 
@@ -34,6 +40,20 @@ pub struct TelegramRuntimeStatus {
     pub allowed_user_ids: Vec<i64>,
     pub pending_count: usize,
     pub last_update_id: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TelegramOnboardingSession {
+    user_id: i64,
+    chat_id: i64,
+    stage: String,
+    assistant_name: String,
+    assistant_style: String,
+    user_name: String,
+    user_role: String,
+    about: String,
+    goals: String,
+    preferences: String,
 }
 
 struct TypingIndicator {
@@ -346,6 +366,20 @@ fn handle_update(
     }
 
     let message = update.text.as_deref().unwrap_or_default();
+    if let Some(reply) = handle_onboarding_command(paths, store, config, update, message)? {
+        adapter.send_message(update.chat_id, &reply)?;
+        return Ok(vec![format!(
+            "processed onboarding command for {}",
+            update.display_name()
+        )]);
+    }
+    if let Some(reply) = handle_onboarding_reply(paths, store, config, update, message)? {
+        adapter.send_message(update.chat_id, &reply)?;
+        return Ok(vec![format!(
+            "updated onboarding session for {}",
+            update.display_name()
+        )]);
+    }
     let typing = start_typing_indicator(adapter.clone(), update.chat_id);
     let outcome = run_chat_session(
         paths,
@@ -359,6 +393,182 @@ fn handle_update(
     let _compaction = outcome.compaction;
     adapter.send_message(update.chat_id, &outcome.response)?;
     Ok(vec![format!("replied to {}", update.display_name())])
+}
+
+fn handle_onboarding_command(
+    _paths: &AssistantPaths,
+    store: &SqliteStore,
+    config: &AppConfig,
+    update: &TelegramUpdate,
+    message: &str,
+) -> Result<Option<String>, String> {
+    let normalized = message.trim();
+    if !normalized.starts_with('/') {
+        return Ok(None);
+    }
+    if normalized.eq_ignore_ascii_case("/cancel") {
+        if delete_onboarding_session(store, update.user_id)? {
+            return Ok(Some("Onboarding canceled.".to_string()));
+        }
+        return Ok(Some("No onboarding session is active.".to_string()));
+    }
+    if !normalized.eq_ignore_ascii_case("/onboard") {
+        return Ok(None);
+    }
+
+    let default_user_name = if !update.first_name.trim().is_empty() {
+        update.first_name.trim().to_string()
+    } else if !update.username.trim().is_empty() {
+        update.username.trim().to_string()
+    } else {
+        "User".to_string()
+    };
+    let session = TelegramOnboardingSession {
+        user_id: update.user_id,
+        chat_id: update.chat_id,
+        stage: "assistant_name".to_string(),
+        assistant_name: config.identity.name.clone(),
+        assistant_style: config.identity.style.clone(),
+        user_name: default_user_name,
+        user_role: String::new(),
+        about: String::new(),
+        goals: String::new(),
+        preferences: "direct, concise, practical".to_string(),
+    };
+    save_onboarding_session(store, &session)?;
+    Ok(Some(format!(
+        "Identity onboarding started.\n1/6 Assistant name [{}]\nReply with a new value, /skip to keep it, or /cancel to stop.",
+        session.assistant_name
+    )))
+}
+
+fn handle_onboarding_reply(
+    paths: &AssistantPaths,
+    store: &SqliteStore,
+    config: &AppConfig,
+    update: &TelegramUpdate,
+    message: &str,
+) -> Result<Option<String>, String> {
+    let Some(mut session) = fetch_onboarding_session(store, update.user_id)? else {
+        return Ok(None);
+    };
+    let trimmed = message.trim();
+    if trimmed.starts_with('/') && !trimmed.eq_ignore_ascii_case("/skip") {
+        return Ok(Some(
+            "Onboarding is in progress. Reply with a value, /skip, or /cancel.".to_string(),
+        ));
+    }
+
+    match session.stage.as_str() {
+        "assistant_name" => {
+            if !trimmed.eq_ignore_ascii_case("/skip") && !trimmed.is_empty() {
+                session.assistant_name = trimmed.to_string();
+            }
+            session.stage = "assistant_style".to_string();
+            save_onboarding_session(store, &session)?;
+            Ok(Some(format!(
+                "2/6 Assistant style [{}]\nDescribe how I should reply. Use /skip to keep it.",
+                session.assistant_style
+            )))
+        }
+        "assistant_style" => {
+            if !trimmed.eq_ignore_ascii_case("/skip") && !trimmed.is_empty() {
+                session.assistant_style = trimmed.to_string();
+            }
+            session.stage = "user_name".to_string();
+            save_onboarding_session(store, &session)?;
+            Ok(Some(format!(
+                "3/6 Your name [{}]\nUse /skip to keep it.",
+                session.user_name
+            )))
+        }
+        "user_name" => {
+            if !trimmed.eq_ignore_ascii_case("/skip") && !trimmed.is_empty() {
+                session.user_name = trimmed.to_string();
+            }
+            session.stage = "user_role".to_string();
+            save_onboarding_session(store, &session)?;
+            Ok(Some(
+                "4/6 Your role or what you do.\nReply with text or /skip.".to_string(),
+            ))
+        }
+        "user_role" => {
+            if !trimmed.eq_ignore_ascii_case("/skip") && !trimmed.is_empty() {
+                session.user_role = trimmed.to_string();
+            }
+            session.stage = "about".to_string();
+            save_onboarding_session(store, &session)?;
+            Ok(Some(
+                "5/6 What should I know about you?\nReply with text or /skip.".to_string(),
+            ))
+        }
+        "about" => {
+            if !trimmed.eq_ignore_ascii_case("/skip") && !trimmed.is_empty() {
+                session.about = trimmed.to_string();
+            }
+            session.stage = "goals".to_string();
+            save_onboarding_session(store, &session)?;
+            Ok(Some(
+                "6/6 Current goals or active projects.\nReply with text or /skip.".to_string(),
+            ))
+        }
+        "goals" => {
+            if !trimmed.eq_ignore_ascii_case("/skip") && !trimmed.is_empty() {
+                session.goals = trimmed.to_string();
+            }
+            session.stage = "preferences".to_string();
+            save_onboarding_session(store, &session)?;
+            Ok(Some(format!(
+                "Final step: preferred reply style [{}]\nReply with text or /skip.",
+                session.preferences
+            )))
+        }
+        "preferences" => {
+            if !trimmed.eq_ignore_ascii_case("/skip") && !trimmed.is_empty() {
+                session.preferences = trimmed.to_string();
+            }
+            complete_onboarding(paths, config, update, &session)?;
+            delete_onboarding_session(store, update.user_id)?;
+            Ok(Some(format!(
+                "Onboarding saved.\nAssistant name: {}\nUser name: {}\nYou can ask \"Do you know me?\" now.",
+                session.assistant_name, session.user_name
+            )))
+        }
+        _ => {
+            delete_onboarding_session(store, update.user_id)?;
+            Ok(Some(
+                "Onboarding state was invalid and has been cleared. Send /onboard to start again."
+                    .to_string(),
+            ))
+        }
+    }
+}
+
+fn complete_onboarding(
+    paths: &AssistantPaths,
+    config: &AppConfig,
+    update: &TelegramUpdate,
+    session: &TelegramOnboardingSession,
+) -> Result<(), String> {
+    let identity = IdentityConfig {
+        name: session.assistant_name.clone(),
+        style: session.assistant_style.clone(),
+        system_instruction: config.identity.system_instruction.clone(),
+    };
+    write_identity_config(paths, &identity)?;
+    let user = UserProfile {
+        name: session.user_name.clone(),
+        telegram_handle: if update.username.trim().is_empty() {
+            String::new()
+        } else {
+            format!("@{}", update.username.trim().trim_start_matches('@'))
+        },
+        role: session.user_role.clone(),
+        about: session.about.clone(),
+        goals: session.goals.clone(),
+        preferences: session.preferences.clone(),
+    };
+    write_assistant_profile(paths, &identity, &user)
 }
 
 fn is_allowed_user(
@@ -375,6 +585,76 @@ fn is_allowed_user(
             user_id
         ))?
         .is_some())
+}
+
+fn fetch_onboarding_session(
+    store: &SqliteStore,
+    user_id: i64,
+) -> Result<Option<TelegramOnboardingSession>, String> {
+    Ok(store
+        .query(&format!(
+            "SELECT user_id, chat_id, stage, assistant_name, assistant_style, user_name, user_role, about, goals, preferences
+             FROM telegram_onboarding_sessions
+             WHERE user_id = {}
+             LIMIT 1;",
+            user_id
+        ))?
+        .into_iter()
+        .next()
+        .and_then(|row| parse_onboarding_session(&row)))
+}
+
+fn save_onboarding_session(
+    store: &SqliteStore,
+    session: &TelegramOnboardingSession,
+) -> Result<(), String> {
+    store.exec(&format!(
+        "INSERT OR REPLACE INTO telegram_onboarding_sessions
+         (user_id, chat_id, stage, assistant_name, assistant_style, user_name, user_role, about, goals, preferences, started_at, updated_at)
+         VALUES ({}, {}, '{}', '{}', '{}', '{}', '{}', '{}', '{}', '{}',
+                 COALESCE((SELECT started_at FROM telegram_onboarding_sessions WHERE user_id = {}), {}),
+                 {});",
+        session.user_id,
+        session.chat_id,
+        sql_escape(&session.stage),
+        sql_escape(&session.assistant_name),
+        sql_escape(&session.assistant_style),
+        sql_escape(&session.user_name),
+        sql_escape(&session.user_role),
+        sql_escape(&session.about),
+        sql_escape(&session.goals),
+        sql_escape(&session.preferences),
+        session.user_id,
+        now_epoch(),
+        now_epoch(),
+    ))
+}
+
+fn delete_onboarding_session(store: &SqliteStore, user_id: i64) -> Result<bool, String> {
+    let existed = fetch_onboarding_session(store, user_id)?.is_some();
+    store.exec(&format!(
+        "DELETE FROM telegram_onboarding_sessions WHERE user_id = {};",
+        user_id
+    ))?;
+    Ok(existed)
+}
+
+fn parse_onboarding_session(row: &[String]) -> Option<TelegramOnboardingSession> {
+    if row.len() < 10 {
+        return None;
+    }
+    Some(TelegramOnboardingSession {
+        user_id: row[0].parse().ok()?,
+        chat_id: row[1].parse().ok()?,
+        stage: row[2].clone(),
+        assistant_name: row[3].clone(),
+        assistant_style: row[4].clone(),
+        user_name: row[5].clone(),
+        user_role: row[6].clone(),
+        about: row[7].clone(),
+        goals: row[8].clone(),
+        preferences: row[9].clone(),
+    })
 }
 
 fn active_pairing_for_user(
@@ -462,15 +742,19 @@ fn set_last_update_id(store: &SqliteStore, value: i64) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use crate::{
         adapters::storage::SqliteStore,
-        config::{AssistantPaths, TelegramConfig},
+        config::{AppConfig, AssistantPaths, TelegramConfig},
         util::unique_temp_dir,
     };
 
     use super::{
-        TelegramUpdate, approve_pairing_code, create_pending_pairing, generate_pairing_code,
-        pairing_expired, runtime_status,
+        TelegramOnboardingSession, TelegramUpdate, approve_pairing_code, complete_onboarding,
+        create_pending_pairing, delete_onboarding_session, fetch_onboarding_session,
+        generate_pairing_code, handle_onboarding_command, handle_onboarding_reply, pairing_expired,
+        runtime_status, save_onboarding_session,
     };
 
     #[test]
@@ -530,5 +814,131 @@ mod tests {
 
         let status = runtime_status(&store, &config).unwrap();
         assert_eq!(status.allowed_user_ids, vec![42]);
+    }
+
+    #[test]
+    fn onboarding_session_round_trip_persists_and_deletes() {
+        let root = unique_temp_dir("assistant-telegram-onboard-session");
+        let paths = AssistantPaths::new(root);
+        paths.ensure_defaults().unwrap();
+        let store = SqliteStore::new(&paths).unwrap();
+        let session = TelegramOnboardingSession {
+            user_id: 42,
+            chat_id: 99,
+            stage: "user_name".into(),
+            assistant_name: "Ayaka".into(),
+            assistant_style: "direct".into(),
+            user_name: "HardCoder".into(),
+            user_role: "Builder".into(),
+            about: "Builds local AI systems".into(),
+            goals: "Fix the assistant".into(),
+            preferences: "concise".into(),
+        };
+
+        save_onboarding_session(&store, &session).unwrap();
+        let loaded = fetch_onboarding_session(&store, 42).unwrap().unwrap();
+        assert_eq!(loaded, session);
+
+        assert!(delete_onboarding_session(&store, 42).unwrap());
+        assert!(fetch_onboarding_session(&store, 42).unwrap().is_none());
+    }
+
+    #[test]
+    fn onboarding_flow_updates_identity_and_profile_files() {
+        let root = unique_temp_dir("assistant-telegram-onboard-flow");
+        let paths = AssistantPaths::new(root);
+        paths.ensure_defaults().unwrap();
+        let store = SqliteStore::new(&paths).unwrap();
+        let config = AppConfig::load(&paths).unwrap();
+        let update = TelegramUpdate {
+            update_id: 7,
+            user_id: 42,
+            chat_id: 42,
+            chat_type: "private".into(),
+            username: "davidb2021".into(),
+            first_name: "David".into(),
+            text: Some("/onboard".into()),
+        };
+
+        let started = handle_onboarding_command(&paths, &store, &config, &update, "/onboard")
+            .unwrap()
+            .unwrap();
+        assert!(started.contains("Identity onboarding started."));
+
+        let prompts = [
+            ("Ayaka", "2/6 Assistant style"),
+            ("direct, practical, concise", "3/6 Your name"),
+            ("HardCoder", "4/6 Your role"),
+            ("Builder", "5/6 What should I know about you?"),
+            ("Builds local AI systems", "6/6 Current goals"),
+            (
+                "Fix the Telegram assistant",
+                "Final step: preferred reply style",
+            ),
+            ("direct, concise, practical", "Onboarding saved."),
+        ];
+
+        for (message, expected) in prompts {
+            let reply = handle_onboarding_reply(&paths, &store, &config, &update, message)
+                .unwrap()
+                .unwrap();
+            assert!(
+                reply.contains(expected),
+                "missing `{expected}` in `{reply}`"
+            );
+        }
+
+        let identity_json = fs::read_to_string(paths.config_dir.join("identity.json")).unwrap();
+        assert!(identity_json.contains("\"name\": \"Ayaka\""));
+        assert!(identity_json.contains("direct, practical, concise"));
+
+        let profile = fs::read_to_string(paths.profiles_dir.join("assistant.md")).unwrap();
+        assert!(profile.contains("Name: Ayaka"));
+        assert!(profile.contains("## User Profile"));
+        assert!(profile.contains("Name: HardCoder"));
+        assert!(profile.contains("Telegram: @davidb2021"));
+        assert!(profile.contains("Role: Builder"));
+        assert!(profile.contains("Fix the Telegram assistant"));
+        assert!(fetch_onboarding_session(&store, 42).unwrap().is_none());
+    }
+
+    #[test]
+    fn complete_onboarding_writes_identity_and_profile() {
+        let root = unique_temp_dir("assistant-telegram-complete");
+        let paths = AssistantPaths::new(root);
+        paths.ensure_defaults().unwrap();
+        let config = AppConfig::load(&paths).unwrap();
+        let update = TelegramUpdate {
+            update_id: 1,
+            user_id: 42,
+            chat_id: 42,
+            chat_type: "private".into(),
+            username: "davidb2021".into(),
+            first_name: "David".into(),
+            text: Some("hello".into()),
+        };
+        let session = TelegramOnboardingSession {
+            user_id: 42,
+            chat_id: 42,
+            stage: "preferences".into(),
+            assistant_name: "Ayaka".into(),
+            assistant_style: "direct, practical, concise".into(),
+            user_name: "HardCoder".into(),
+            user_role: "Builder".into(),
+            about: "Builds local AI systems".into(),
+            goals: "Fix the Telegram assistant".into(),
+            preferences: "direct, concise, practical".into(),
+        };
+
+        complete_onboarding(&paths, &config, &update, &session).unwrap();
+
+        let identity_json = fs::read_to_string(paths.config_dir.join("identity.json")).unwrap();
+        assert!(identity_json.contains("\"name\": \"Ayaka\""));
+        assert!(identity_json.contains("direct, practical, concise"));
+
+        let profile = fs::read_to_string(paths.profiles_dir.join("assistant.md")).unwrap();
+        assert!(profile.contains("Name: Ayaka"));
+        assert!(profile.contains("Name: HardCoder"));
+        assert!(profile.contains("Telegram: @davidb2021"));
     }
 }

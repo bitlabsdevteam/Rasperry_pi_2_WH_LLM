@@ -1,0 +1,17 @@
+{
+  "enabled": false,
+  "input_device": "",
+  "output_device": "",
+  "sample_rate": 16000,
+  "capture_seconds_max": 8,
+  "stt_binary_path": "whisper-cli",
+  "stt_model_path": "data/models/whisper.bin",
+  "tts_binary_path": "piper",
+  "tts_model_path": "data/models/piper.onnx",
+  "player_binary_path": "aplay",
+  "recorder_binary_path": "arecord",
+  "trigger_mode": "push_to_talk",
+  "push_to_talk_command": "",
+  "silence_timeout_ms": 1200,
+  "temp_audio_dir": "data/voice/tmp"
+}

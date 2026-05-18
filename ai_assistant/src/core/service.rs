@@ -34,7 +34,7 @@ pub fn run_chat_session(
 
     if let Some(response) = capability_response(paths, config, &identity, message)? {
         record_turn(paths, store, session, "assistant", &response)?;
-        let compaction = maybe_compact(paths, store, session, &config.memory)?;
+        let compaction = maybe_compact(paths, store, session, &config.memory, &config.llm)?;
         return Ok(ChatOutput {
             response,
             compaction,
@@ -89,7 +89,7 @@ pub fn run_chat_session(
     };
 
     record_turn(paths, store, session, "assistant", &response)?;
-    let compaction = maybe_compact(paths, store, session, &config.memory)?;
+    let compaction = maybe_compact(paths, store, session, &config.memory, &config.llm)?;
 
     Ok(ChatOutput {
         response,
@@ -109,14 +109,12 @@ fn capability_response(
     }
     if asks_about_known_user(&normalized) {
         return Ok(Some(render_known_user_response(
+            message,
             &identity.known_user_facts(),
         )));
     }
     if is_greeting_message(&normalized) {
-        return Ok(Some(
-            "Hello. I’m online locally. Ask one question and I’ll keep the reply short."
-                .to_string(),
-        ));
+        return Ok(Some("Hey, I'm here. What do you need?".to_string()));
     }
     if asks_about_ml_ai(&normalized) {
         return Ok(Some("AI is the broad field of building systems that perform tasks requiring human-like intelligence. ML is a subset of AI where models learn patterns from data to make predictions or decisions.".to_string()));
@@ -288,10 +286,7 @@ fn deterministic_response(message: &str) -> Option<String> {
         return Some(response);
     }
     if is_greeting_message(&normalized) {
-        return Some(
-            "Hello. I’m online locally. Ask one question and I’ll keep the reply short."
-                .to_string(),
-        );
+        return Some("Hey, I'm here. What do you need?".to_string());
     }
     if asks_about_ml_ai(&normalized) {
         return Some("AI is the broad field of building systems that perform tasks requiring human-like intelligence. ML is a subset of AI where models learn patterns from data to make predictions or decisions.".to_string());
@@ -569,11 +564,183 @@ fn asks_about_known_user(message: &str) -> bool {
     .any(|needle| message.contains(needle))
 }
 
-fn render_known_user_response(facts: &[String]) -> String {
+fn render_known_user_response(message: &str, facts: &[String]) -> String {
     if facts.is_empty() {
         return "Not yet. I do not have a saved user profile yet, so rerun onboarding and fill in your details.".to_string();
     }
-    format!("I know this about you: {}.", facts.join("; "))
+
+    let summary = known_user_summary(facts);
+    let normalized = message.to_ascii_lowercase();
+
+    if normalized.contains("what is my name") {
+        if let Some(name) = extract_prefixed_fact(facts, "Name:") {
+            return format!("Your name is {name}.");
+        }
+    }
+
+    if normalized.contains("who am i") {
+        return match (&summary.name, &summary.description) {
+            (Some(name), Some(description)) => format!("You're {name}. {description}."),
+            (Some(name), None) => format!("You're {name}."),
+            (None, Some(description)) => description.clone() + ".",
+            (None, None) => {
+                "I know a few details about you, but not enough to answer that clearly yet."
+                    .to_string()
+            }
+        };
+    }
+
+    let mut parts = Vec::new();
+    if let Some(name) = summary.name {
+        parts.push(format!("You're {name}"));
+    }
+    if let Some(description) = summary.description {
+        parts.push(description);
+    }
+    if let Some(preference) = summary.preference {
+        parts.push(preference);
+    }
+
+    if parts.is_empty() {
+        "Yes. I have a saved profile for you, but it needs more detail.".to_string()
+    } else {
+        format!("Yes. {}.", parts.join(". "))
+    }
+}
+
+struct KnownUserSummary {
+    name: Option<String>,
+    description: Option<String>,
+    preference: Option<String>,
+}
+
+fn known_user_summary(facts: &[String]) -> KnownUserSummary {
+    let name = extract_prefixed_fact(facts, "Name:");
+    let role = extract_prefixed_fact(facts, "Role:").map(|value| rewrite_first_person_fact(&value));
+    let raw_preference = extract_preference_fact(facts);
+    let preference = raw_preference
+        .as_ref()
+        .map(|value| rewrite_preference_fact(value));
+
+    let mut description_candidates = facts
+        .iter()
+        .filter(|fact| {
+            !fact.starts_with("Name:")
+                && !fact.starts_with("Telegram:")
+                && !fact.starts_with("Role:")
+                && Some(fact.trim()) != raw_preference.as_deref()
+        })
+        .map(|fact| rewrite_first_person_fact(fact))
+        .filter(|fact| !fact.is_empty())
+        .collect::<Vec<_>>();
+
+    let description = if let Some(role) = role {
+        let richer_match = description_candidates.iter().find(|candidate| {
+            let candidate_text = normalized_descriptor(candidate);
+            let role_text = normalized_descriptor(&role);
+            candidate_text.contains(&role_text) || role_text.contains(&candidate_text)
+        });
+        if let Some(candidate) = richer_match {
+            Some(candidate.clone())
+        } else if let Some(first) = description_candidates.first() {
+            Some(format!("{role}. {}", first.trim_end_matches('.')))
+        } else {
+            Some(role)
+        }
+    } else {
+        description_candidates.drain(..1).next()
+    };
+
+    KnownUserSummary {
+        name,
+        description,
+        preference,
+    }
+}
+
+fn extract_prefixed_fact(facts: &[String], prefix: &str) -> Option<String> {
+    facts
+        .iter()
+        .find_map(|fact| {
+            fact.strip_prefix(prefix)
+                .map(|value| value.trim().to_string())
+        })
+        .filter(|value| !value.is_empty())
+}
+
+fn extract_preference_fact(facts: &[String]) -> Option<String> {
+    facts
+        .iter()
+        .find(|fact| {
+            !fact.starts_with("Name:")
+                && !fact.starts_with("Telegram:")
+                && !fact.starts_with("Role:")
+                && (fact.to_ascii_lowercase().contains("concise")
+                    || fact.to_ascii_lowercase().contains("prefer"))
+        })
+        .map(|fact| fact.trim().to_string())
+}
+
+fn rewrite_first_person_fact(value: &str) -> String {
+    let trimmed = value.trim().trim_end_matches('.').to_string();
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("i am ") {
+        return format!("You're {}", trimmed[5..].trim());
+    }
+    if lower.starts_with("i'm ") {
+        return format!("You're {}", trimmed[4..].trim());
+    }
+    if lower.starts_with("my ") {
+        return format!("Your {}", trimmed[3..].trim());
+    }
+    if lower.starts_with("prefer ") || lower.starts_with("prefers ") {
+        return capitalize_first(&trimmed);
+    }
+    capitalize_first(&trimmed)
+}
+
+fn rewrite_preference_fact(value: &str) -> String {
+    let trimmed = value.trim().trim_end_matches('.').to_string();
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("i prefer ") {
+        return format!("You prefer {}", trimmed[9..].trim());
+    }
+    if lower.starts_with("prefer ") {
+        return format!("You prefer {}", trimmed[7..].trim());
+    }
+    if lower.starts_with("prefers ") {
+        return format!("You prefer {}", trimmed[8..].trim());
+    }
+    format!("You prefer {} replies", trimmed)
+}
+
+fn normalized_text(value: &str) -> String {
+    value
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .collect()
+}
+
+fn normalized_descriptor(value: &str) -> String {
+    normalized_text(
+        value
+            .trim()
+            .trim_start_matches("You're ")
+            .trim_start_matches("you're ")
+            .trim_start_matches("You are ")
+            .trim_start_matches("you are ")
+            .trim_start_matches("an ")
+            .trim_start_matches("a "),
+    )
+}
+
+fn capitalize_first(value: &str) -> String {
+    let mut chars = value.chars();
+    match chars.next() {
+        Some(first) => format!("{}{}", first.to_ascii_uppercase(), chars.as_str()),
+        None => String::new(),
+    }
 }
 
 fn starts_with_greeting(message: &str) -> bool {
@@ -613,7 +780,8 @@ mod tests {
 
     use crate::config::{
         AppConfig, AssistantPaths, IdentityConfig, LlmConfig, MemoryConfig, SchedulerConfig,
-        TelegramConfig, ToolConfig,
+        TelegramConfig, ToolConfig, VoiceConfig, default_voice_stt_model_path,
+        default_voice_temp_audio_dir, default_voice_tts_model_path,
     };
     use crate::core::identity::IdentityProfile;
     use crate::util::unique_temp_dir;
@@ -661,6 +829,7 @@ mod tests {
                 compact_after_turns: 12,
                 retain_recent_turns: 6,
                 token_budget: 512,
+                compact_context_threshold_percent: 70,
                 memory_search_limit: 4,
                 memory_ttl_days: 30,
             },
@@ -686,6 +855,7 @@ mod tests {
                 pairing_code_ttl_minutes: 15,
                 api_base_url: "https://api.telegram.org".into(),
             },
+            voice: voice_config_for_tests(&AssistantPaths::new(PathBuf::from("/tmp"))),
         };
         assert_eq!(prompt_budget(&config), 128);
     }
@@ -801,6 +971,7 @@ mod tests {
                     compact_after_turns: 12,
                     retain_recent_turns: 6,
                     token_budget: 128,
+                    compact_context_threshold_percent: 70,
                     memory_search_limit: 4,
                     memory_ttl_days: 30,
                 },
@@ -828,6 +999,7 @@ mod tests {
                     pairing_code_ttl_minutes: 15,
                     api_base_url: "https://api.telegram.org".into(),
                 },
+                voice: voice_config_for_tests(&AssistantPaths::new(PathBuf::from("/tmp"))),
             },
             &IdentityProfile {
                 name: "Kumo".into(),
@@ -840,7 +1012,7 @@ mod tests {
         .unwrap()
         .unwrap();
 
-        assert!(response.contains("Ask one question"));
+        assert_eq!(response, "Hey, I'm here. What do you need?");
     }
 
     #[test]
@@ -889,9 +1061,75 @@ Preferences:
             .unwrap()
             .unwrap();
 
-        assert!(response.contains("David Bong"));
-        assert!(response.contains("@davidb2021"));
-        assert!(response.contains("HardCoder"));
+        assert_eq!(
+            response,
+            "Yes. You're David Bong. HardCoder. You prefer direct, concise replies."
+        );
+    }
+
+    #[test]
+    fn capability_response_answers_name_question_naturally() {
+        let root = unique_temp_dir("assistant-capability-user-name");
+        let paths = AssistantPaths::new(root);
+        paths.ensure_defaults().unwrap();
+        fs::write(
+            paths.profiles_dir.join("assistant.md"),
+            "# Assistant Profile
+
+Name: Ayaka
+
+## User Profile
+Name: David
+Role: I am AI Researcher
+About:
+- I am an AI Researcher and Engineer
+Preferences:
+- concise
+",
+        )
+        .unwrap();
+        let config = base_config_with_tools(vec!["date".into()]);
+        let identity = IdentityProfile::load(&paths, &config.identity).unwrap();
+
+        let response = capability_response(&paths, &config, &identity, "what is my name")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(response, "Your name is David.");
+    }
+
+    #[test]
+    fn capability_response_answers_known_user_question_naturally() {
+        let root = unique_temp_dir("assistant-capability-user-natural");
+        let paths = AssistantPaths::new(root);
+        paths.ensure_defaults().unwrap();
+        fs::write(
+            paths.profiles_dir.join("assistant.md"),
+            "# Assistant Profile
+
+Name: Ayaka
+
+## User Profile
+Name: David
+Role: I am AI Researcher
+About:
+- I am an AI Researcher and Engineer
+Preferences:
+- concise
+",
+        )
+        .unwrap();
+        let config = base_config_with_tools(vec!["date".into()]);
+        let identity = IdentityProfile::load(&paths, &config.identity).unwrap();
+
+        let response = capability_response(&paths, &config, &identity, "Do you know me?")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            response,
+            "Yes. You're David. You're an AI Researcher and Engineer. You prefer concise replies."
+        );
     }
 
     fn base_config_with_tools(allowlist: Vec<String>) -> AppConfig {
@@ -915,6 +1153,7 @@ Preferences:
                 compact_after_turns: 12,
                 retain_recent_turns: 6,
                 token_budget: 512,
+                compact_context_threshold_percent: 70,
                 memory_search_limit: 4,
                 memory_ttl_days: 30,
             },
@@ -940,6 +1179,27 @@ Preferences:
                 pairing_code_ttl_minutes: 15,
                 api_base_url: "https://api.telegram.org".into(),
             },
+            voice: voice_config_for_tests(&AssistantPaths::new(PathBuf::from("/tmp"))),
+        }
+    }
+
+    fn voice_config_for_tests(paths: &AssistantPaths) -> VoiceConfig {
+        VoiceConfig {
+            enabled: false,
+            input_device: String::new(),
+            output_device: String::new(),
+            sample_rate: 16000,
+            capture_seconds_max: 8,
+            stt_binary_path: "whisper-cli".into(),
+            stt_model_path: default_voice_stt_model_path(paths),
+            tts_binary_path: "piper".into(),
+            tts_model_path: default_voice_tts_model_path(paths),
+            player_binary_path: "aplay".into(),
+            recorder_binary_path: "arecord".into(),
+            trigger_mode: "push_to_talk".into(),
+            push_to_talk_command: String::new(),
+            silence_timeout_ms: 1200,
+            temp_audio_dir: default_voice_temp_audio_dir(paths),
         }
     }
 }

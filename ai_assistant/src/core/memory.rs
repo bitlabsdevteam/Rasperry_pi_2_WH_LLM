@@ -87,6 +87,16 @@ pub fn turn_count(store: &SqliteStore, session_id: &str) -> Result<usize, String
         .unwrap_or(0))
 }
 
+pub fn session_token_estimate(store: &SqliteStore, session_id: &str) -> Result<usize, String> {
+    Ok(store
+        .scalar(&format!(
+            "SELECT COALESCE(SUM(token_estimate), 0) FROM conversation_turns WHERE session_id = '{}';",
+            sql_escape(session_id)
+        ))?
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0))
+}
+
 pub fn search_memories(
     store: &SqliteStore,
     query: &str,
@@ -301,7 +311,7 @@ mod tests {
 
     use super::{
         add_memory_with_expiry, cleanup_expired_memories, compact_session, record_turn,
-        search_memories, summarize_session, turn_count,
+        search_memories, session_token_estimate, summarize_session, turn_count,
     };
 
     #[test]
@@ -336,6 +346,7 @@ mod tests {
         let compacted = compact_session(&paths, &store, "default", 4).unwrap();
         assert!(compacted.contains("compacted session"));
         assert_eq!(turn_count(&store, "default").unwrap(), 4);
+        assert!(session_token_estimate(&store, "default").unwrap() > 0);
 
         let memories = search_memories(&store, "Summary", 5).unwrap();
         assert!(!memories.is_empty());

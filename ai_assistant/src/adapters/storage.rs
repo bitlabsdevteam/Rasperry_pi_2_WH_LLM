@@ -99,6 +99,20 @@ CREATE TABLE IF NOT EXISTS telegram_allowlist (
     approved_at INTEGER NOT NULL,
     is_owner INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS telegram_onboarding_sessions (
+    user_id INTEGER PRIMARY KEY,
+    chat_id INTEGER NOT NULL,
+    stage TEXT NOT NULL,
+    assistant_name TEXT NOT NULL DEFAULT '',
+    assistant_style TEXT NOT NULL DEFAULT '',
+    user_name TEXT NOT NULL DEFAULT '',
+    user_role TEXT NOT NULL DEFAULT '',
+    about TEXT NOT NULL DEFAULT '',
+    goals TEXT NOT NULL DEFAULT '',
+    preferences TEXT NOT NULL DEFAULT '',
+    started_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
 CREATE VIRTUAL TABLE IF NOT EXISTS rag_fts USING fts5(path, title, content);
 "#;
         self.exec(schema)

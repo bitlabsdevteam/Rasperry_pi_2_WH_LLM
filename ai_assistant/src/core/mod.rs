@@ -10,3 +10,4 @@ pub mod skills;
 pub mod tasks;
 pub mod telegram;
 pub mod tools;
+pub mod voice;

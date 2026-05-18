@@ -2,7 +2,8 @@
   "recent_turn_limit": 8,
   "compact_after_turns": 12,
   "retain_recent_turns": 6,
-  "token_budget": 512,
+  "token_budget": 2048,
+  "compact_context_threshold_percent": 70,
   "memory_search_limit": 6,
   "memory_ttl_days": 30
 }
