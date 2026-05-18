@@ -1,0 +1,14 @@
+[Unit]
+Description=Local AI Assistant for Raspberry Pi Zero 2 WH
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/ai_assistant
+ExecStart=/opt/ai_assistant/target/release/ai_assistant serve
+Restart=always
+RestartSec=5
+Environment=AI_ASSISTANT_ROOT=/opt/ai_assistant
+
+[Install]
+WantedBy=multi-user.target

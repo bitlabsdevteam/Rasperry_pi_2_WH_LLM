@@ -1,0 +1,8 @@
+{
+  "recent_turn_limit": 8,
+  "compact_after_turns": 12,
+  "retain_recent_turns": 6,
+  "token_budget": 512,
+  "memory_search_limit": 6,
+  "memory_ttl_days": 30
+}

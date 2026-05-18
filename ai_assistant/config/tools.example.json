@@ -1,0 +1,3 @@
+{
+  "allowlist": ["date", "echo", "ls", "pwd", "cat"]
+}

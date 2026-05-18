@@ -1,0 +1,14 @@
+{
+  "prefer_http": false,
+  "endpoint": "http://127.0.0.1:8080/v1/chat/completions",
+  "health_endpoint": "http://127.0.0.1:8080/health",
+  "model": "smollm2-135m-instruct",
+  "binary_path": "/absolute/path/to/llama-cli",
+  "model_path": "/absolute/path/to/model.gguf",
+  "threads": 2,
+  "context_size": 1024,
+  "predict_tokens": 64,
+  "timeout_secs": 20,
+  "retries": 2,
+  "stream": true
+}

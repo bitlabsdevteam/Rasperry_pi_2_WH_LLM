@@ -1,0 +1,5 @@
+{
+  "poll_seconds": 30,
+  "max_jobs_per_tick": 4,
+  "allow_shell_jobs": false
+}

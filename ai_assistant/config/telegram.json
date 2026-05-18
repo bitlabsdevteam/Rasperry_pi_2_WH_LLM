@@ -1,0 +1,11 @@
+{
+  "enabled": false,
+  "bot_token": "",
+  "bot_token_file": "",
+  "poll_timeout_secs": 30,
+  "owner_user_id": "",
+  "allowed_user_ids": [],
+  "pairing_enabled": true,
+  "pairing_code_ttl_minutes": 15,
+  "api_base_url": "https://api.telegram.org"
+}
