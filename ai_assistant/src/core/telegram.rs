@@ -1,8 +1,5 @@
 use std::{
     collections::BTreeSet,
-    sync::mpsc,
-    thread::{self, JoinHandle},
-    time::Duration,
 };
 
 use crate::{
@@ -16,7 +13,9 @@ use crate::{
     },
     core::{
         identity::{UserProfile, write_assistant_profile},
-        service::run_chat_session,
+        inbound_queue::{InboundRequest, enqueue_request},
+        service::run_chat_session_with_session,
+        session::Session,
     },
     util::{now_epoch, sql_escape},
 };
@@ -54,18 +53,6 @@ struct TelegramOnboardingSession {
     about: String,
     goals: String,
     preferences: String,
-}
-
-struct TypingIndicator {
-    stop_tx: mpsc::Sender<()>,
-    handle: JoinHandle<()>,
-}
-
-impl TypingIndicator {
-    fn stop(self) {
-        let _ = self.stop_tx.send(());
-        let _ = self.handle.join();
-    }
 }
 
 pub fn session_key(user_id: i64) -> String {
@@ -258,24 +245,6 @@ pub fn process_telegram_once(
     Ok(logs)
 }
 
-fn start_typing_indicator(adapter: TelegramAdapter, chat_id: i64) -> TypingIndicator {
-    let _ = adapter.send_chat_action(chat_id, "typing");
-
-    let (stop_tx, stop_rx) = mpsc::channel();
-    let handle = thread::spawn(move || {
-        loop {
-            match stop_rx.recv_timeout(Duration::from_secs(4)) {
-                Ok(_) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    let _ = adapter.send_chat_action(chat_id, "typing");
-                }
-            }
-        }
-    });
-
-    TypingIndicator { stop_tx, handle }
-}
-
 pub fn poll_for_first_pairing(
     paths: &AssistantPaths,
     store: &SqliteStore,
@@ -322,6 +291,29 @@ pub fn send_message(
         return Err("telegram is not configured".to_string());
     };
     adapter.send_message(chat_id, text)
+}
+
+pub fn send_reply(
+    paths: &AssistantPaths,
+    config: &TelegramConfig,
+    chat_id: i64,
+    text: &str,
+    chunk_chars: usize,
+) -> Result<(), String> {
+    let chunks = split_reply_chunks(text, chunk_chars.max(64));
+    if chunks.is_empty() {
+        return send_message(paths, config, chat_id, text);
+    }
+    let total = chunks.len();
+    for (index, chunk) in chunks.into_iter().enumerate() {
+        let body = if total == 1 {
+            chunk
+        } else {
+            format!("({}/{}) {}", index + 1, total, chunk)
+        };
+        send_message(paths, config, chat_id, &body)?;
+    }
+    Ok(())
 }
 
 fn handle_update(
@@ -380,19 +372,132 @@ fn handle_update(
             update.display_name()
         )]);
     }
-    let typing = start_typing_indicator(adapter.clone(), update.chat_id);
-    let outcome = run_chat_session(
-        paths,
-        config,
+    let session = Session::telegram_dm(update.user_id, update.chat_id, config);
+    if !config.messages.queue.enabled {
+        let _ = adapter.send_chat_action(update.chat_id, "typing");
+        let outcome = run_chat_session_with_session(paths, config, store, &session, message, false)?;
+        send_reply(
+            paths,
+            &config.telegram,
+            update.chat_id,
+            &outcome.response,
+            config.messages.reply.telegram_chunk_chars,
+        )?;
+        return Ok(vec![format!("replied to {}", update.display_name())]);
+    }
+    let _ = adapter.send_chat_action(update.chat_id, "typing");
+    let queued = enqueue_request(
         store,
-        &session_key(update.user_id),
-        message,
-        config.llm.stream,
+        &config.messages.queue,
+        &InboundRequest {
+            session,
+            message_text: message.to_string(),
+        },
     )?;
-    typing.stop();
-    let _compaction = outcome.compaction;
-    adapter.send_message(update.chat_id, &outcome.response)?;
-    Ok(vec![format!("replied to {}", update.display_name())])
+    Ok(vec![format!(
+        "queued Telegram message for {} ({})",
+        update.display_name(),
+        if queued.merged { "merged" } else { "new" }
+    )])
+}
+
+fn split_reply_chunks(text: &str, chunk_chars: usize) -> Vec<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return vec![String::new()];
+    }
+    if trimmed.chars().count() <= chunk_chars {
+        return vec![trimmed.to_string()];
+    }
+
+    let mut chunks = Vec::new();
+    let mut remaining = trimmed;
+    let mut open_fence_lang = String::new();
+
+    while !remaining.trim().is_empty() {
+        let prefix = if open_fence_lang.is_empty() {
+            String::new()
+        } else {
+            format!("```{}\n", open_fence_lang)
+        };
+        let mut budget = chunk_chars.saturating_sub(prefix.chars().count()).max(1);
+        let mut cut = find_chunk_boundary(remaining, budget);
+        let mut head = remaining[..cut].trim();
+        if head.is_empty() {
+            break;
+        }
+        let mut next_open_fence = updated_fence_language(&open_fence_lang, head);
+        let suffix = if next_open_fence.is_empty() {
+            String::new()
+        } else {
+            "\n```".to_string()
+        };
+        if prefix.chars().count() + head.chars().count() + suffix.chars().count() > chunk_chars
+            && budget > suffix.chars().count()
+        {
+            budget = budget.saturating_sub(suffix.chars().count()).max(1);
+            cut = find_chunk_boundary(remaining, budget);
+            head = remaining[..cut].trim();
+            next_open_fence = updated_fence_language(&open_fence_lang, head);
+        }
+        let body = format!("{prefix}{head}{suffix}");
+        chunks.push(body.trim().to_string());
+        open_fence_lang = next_open_fence;
+        remaining = remaining[cut..].trim_start();
+    }
+
+    if chunks.is_empty() {
+        vec![trimmed.to_string()]
+    } else {
+        chunks
+    }
+}
+
+fn find_chunk_boundary(text: &str, max_chars: usize) -> usize {
+    let mut count = 0usize;
+    let mut last_paragraph = None;
+    let mut last_line = None;
+    let mut last_space = None;
+    let mut last_index = 0usize;
+    for (index, ch) in text.char_indices() {
+        let ch_len = ch.len_utf8();
+        if count + 1 > max_chars {
+            break;
+        }
+        count += 1;
+        last_index = index + ch_len;
+        if text[..last_index].ends_with("\n\n") {
+            last_paragraph = Some(last_index);
+        }
+        if ch == '\n' {
+            last_line = Some(last_index);
+        }
+        if ch.is_whitespace() {
+            last_space = Some(last_index);
+        }
+    }
+    if last_index == text.len() {
+        return text.len();
+    }
+    last_paragraph
+        .or(last_line)
+        .or(last_space)
+        .unwrap_or(last_index.max(1))
+}
+
+fn updated_fence_language(current: &str, chunk: &str) -> String {
+    let mut active = current.to_string();
+    for line in chunk.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("```") {
+            if active.is_empty() {
+                active = rest.trim().to_string();
+            } else {
+                active.clear();
+            }
+        }
+    }
+    active
 }
 
 fn handle_onboarding_command(
@@ -754,7 +859,7 @@ mod tests {
         TelegramOnboardingSession, TelegramUpdate, approve_pairing_code, complete_onboarding,
         create_pending_pairing, delete_onboarding_session, fetch_onboarding_session,
         generate_pairing_code, handle_onboarding_command, handle_onboarding_reply, pairing_expired,
-        runtime_status, save_onboarding_session,
+        runtime_status, save_onboarding_session, split_reply_chunks,
     };
 
     #[test]
@@ -940,5 +1045,24 @@ mod tests {
         assert!(profile.contains("Name: Ayaka"));
         assert!(profile.contains("Name: HardCoder"));
         assert!(profile.contains("Telegram: @davidb2021"));
+    }
+
+    #[test]
+    fn long_plain_text_reply_splits_into_ordered_chunks() {
+        let text = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu";
+        let chunks = split_reply_chunks(text, 20);
+        assert!(chunks.len() > 1);
+        assert!(chunks.iter().all(|chunk| chunk.chars().count() <= 20));
+        assert!(chunks[0].contains("alpha"));
+        assert!(chunks.last().unwrap().contains("mu"));
+    }
+
+    #[test]
+    fn long_fenced_code_reply_reopens_fences_per_chunk() {
+        let text = "```python\nfor i in range(5):\n    print(i)\n    print(i + 1)\n    print(i + 2)\n```";
+        let chunks = split_reply_chunks(text, 35);
+        assert!(chunks.len() > 1);
+        assert!(chunks.iter().all(|chunk| chunk.starts_with("```")));
+        assert!(chunks.iter().all(|chunk| chunk.ends_with("```")));
     }
 }

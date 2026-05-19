@@ -1,12 +1,16 @@
+pub mod actions;
 pub mod context;
 pub mod harness;
 pub mod identity;
+pub mod inbound_queue;
 pub mod memory;
 pub mod prompts;
 pub mod rag;
 pub mod scheduler;
+pub mod session;
 pub mod service;
 pub mod skills;
+pub mod surfaces;
 pub mod tasks;
 pub mod telegram;
 pub mod tools;

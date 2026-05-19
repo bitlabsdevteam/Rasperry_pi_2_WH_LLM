@@ -28,6 +28,21 @@ pub struct MemoryRecord {
     pub tags: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemoryScope {
+    Any,
+    Personal,
+    Knowledge,
+    Runtime,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct MemoryContextBundle {
+    pub personal: Vec<MemoryRecord>,
+    pub knowledge: Vec<MemoryRecord>,
+    pub runtime: Vec<MemoryRecord>,
+}
+
 pub fn record_turn(
     paths: &AssistantPaths,
     store: &SqliteStore,
@@ -102,7 +117,15 @@ pub fn search_memories(
     query: &str,
     limit: usize,
 ) -> Result<Vec<MemoryRecord>, String> {
-    let escaped = sql_escape(query);
+    search_memories_in_scope(store, query, limit, MemoryScope::Any)
+}
+
+pub fn search_memories_in_scope(
+    store: &SqliteStore,
+    query: &str,
+    limit: usize,
+    scope: MemoryScope,
+) -> Result<Vec<MemoryRecord>, String> {
     let rows = store.query(&format!(
         "SELECT
             replace(replace(title, char(10), ' '), char(13), ' '),
@@ -111,11 +134,10 @@ pub fn search_memories(
             score
          FROM memories
          WHERE (expires_at IS NULL OR expires_at > {})
-           AND (title LIKE '%{escaped}%' OR body LIKE '%{escaped}%' OR tags LIKE '%{escaped}%')
          ORDER BY created_at DESC
          LIMIT {};",
         now_epoch(),
-        limit * 4
+        limit * 12
     ))?;
     let mut memories = rows
         .into_iter()
@@ -130,6 +152,8 @@ pub fn search_memories(
                 })
             }
         })
+        .filter(|record| matches_scope(record, scope))
+        .filter(|record| query.trim().is_empty() || score_memory(query, &record.title, &record.body, &record.tags) > 0)
         .collect::<Vec<_>>();
     memories.sort_by(|left, right| {
         let left_score = score_memory(query, &left.title, &left.body, &left.tags);
@@ -138,6 +162,18 @@ pub fn search_memories(
     });
     memories.truncate(limit);
     Ok(memories)
+}
+
+pub fn collect_memory_context(
+    store: &SqliteStore,
+    query: &str,
+    limit: usize,
+) -> Result<MemoryContextBundle, String> {
+    Ok(MemoryContextBundle {
+        personal: search_memories_in_scope(store, query, limit, MemoryScope::Personal)?,
+        knowledge: search_memories_in_scope(store, query, limit, MemoryScope::Knowledge)?,
+        runtime: search_memories_in_scope(store, query, limit, MemoryScope::Runtime)?,
+    })
 }
 
 pub fn add_memory(
@@ -305,13 +341,39 @@ fn score_memory(query: &str, title: &str, body: &str, tags: &str) -> i64 {
         .sum()
 }
 
+fn matches_scope(record: &MemoryRecord, scope: MemoryScope) -> bool {
+    let tags = format!(
+        "{} {} {}",
+        record.tags.to_ascii_lowercase(),
+        record.title.to_ascii_lowercase(),
+        record.body.to_ascii_lowercase()
+    );
+    match scope {
+        MemoryScope::Any => true,
+        MemoryScope::Personal => {
+            contains_any(&tags, &["personal", "profile", "preference", "contact", "goal"])
+        }
+        MemoryScope::Knowledge => {
+            contains_any(&tags, &["knowledge", "doc", "rag", "summary", "reference"])
+        }
+        MemoryScope::Runtime => {
+            contains_any(&tags, &["runtime", "task", "job", "queue", "status"])
+        }
+    }
+}
+
+fn contains_any(value: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| value.contains(needle))
+}
+
 #[cfg(test)]
 mod tests {
     use crate::{adapters::storage::SqliteStore, config::AssistantPaths, util::unique_temp_dir};
 
     use super::{
-        add_memory_with_expiry, cleanup_expired_memories, compact_session, record_turn,
-        search_memories, session_token_estimate, summarize_session, turn_count,
+        add_memory_with_expiry, cleanup_expired_memories, collect_memory_context,
+        compact_session, record_turn, search_memories, session_token_estimate,
+        summarize_session, turn_count,
     };
 
     #[test]
@@ -350,6 +412,41 @@ mod tests {
 
         let memories = search_memories(&store, "Summary", 5).unwrap();
         assert!(!memories.is_empty());
+    }
+
+    #[test]
+    fn memory_context_bundle_splits_personal_and_runtime_records() {
+        let root = unique_temp_dir("assistant-memory-bundle");
+        let paths = AssistantPaths::new(root);
+        paths.ensure_defaults().unwrap();
+        let store = SqliteStore::new(&paths).unwrap();
+
+        add_memory_with_expiry(
+            &store,
+            "personal",
+            "profile",
+            "User preference",
+            "Prefers direct replies",
+            "personal,preference",
+            1.0,
+            Some(30),
+        )
+        .unwrap();
+        add_memory_with_expiry(
+            &store,
+            "runtime",
+            "queue",
+            "Queue pressure",
+            "One session is currently queued",
+            "runtime,queue,status",
+            1.0,
+            Some(7),
+        )
+        .unwrap();
+
+        let bundle = collect_memory_context(&store, "prefers queued", 4).unwrap();
+        assert_eq!(bundle.personal.len(), 1);
+        assert_eq!(bundle.runtime.len(), 1);
     }
 
     #[test]

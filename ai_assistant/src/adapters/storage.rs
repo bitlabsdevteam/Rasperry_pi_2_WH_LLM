@@ -39,6 +39,20 @@ CREATE TABLE IF NOT EXISTS conversation_turns (
     created_at INTEGER NOT NULL,
     token_estimate INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS sessions (
+    session_id TEXT PRIMARY KEY,
+    surface TEXT NOT NULL,
+    peer_id TEXT,
+    chat_id TEXT,
+    session_kind TEXT NOT NULL,
+    activation_mode TEXT NOT NULL,
+    reply_policy TEXT NOT NULL,
+    tool_policy TEXT NOT NULL,
+    model_policy TEXT NOT NULL,
+    state TEXT NOT NULL,
+    last_message_at INTEGER,
+    updated_at INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS memories (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     kind TEXT NOT NULL,
@@ -113,9 +127,55 @@ CREATE TABLE IF NOT EXISTS telegram_onboarding_sessions (
     started_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS inbound_queue (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    surface TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    peer_id TEXT,
+    chat_id TEXT,
+    message_text TEXT NOT NULL,
+    status TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    available_at INTEGER NOT NULL,
+    started_at INTEGER,
+    finished_at INTEGER,
+    merged_count INTEGER NOT NULL DEFAULT 1,
+    summary_text TEXT,
+    error_text TEXT,
+    response_text TEXT
+);
+CREATE TABLE IF NOT EXISTS inbound_queue_leases (
+    lease_key TEXT PRIMARY KEY,
+    scope TEXT NOT NULL,
+    item_id INTEGER NOT NULL,
+    session_id TEXT NOT NULL,
+    leased_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL
+);
 CREATE VIRTUAL TABLE IF NOT EXISTS rag_fts USING fts5(path, title, content);
 "#;
-        self.exec(schema)
+        self.exec(schema)?;
+        self.migrate_legacy_schema()
+    }
+
+    fn migrate_legacy_schema(&self) -> Result<(), String> {
+        if !self.column_exists("inbound_queue", "peer_id")? {
+            self.exec("ALTER TABLE inbound_queue ADD COLUMN peer_id TEXT;")?;
+        }
+        if !self.column_exists("sessions", "last_message_at")? {
+            self.exec("ALTER TABLE sessions ADD COLUMN last_message_at INTEGER;")?;
+        }
+        if !self.column_exists("sessions", "updated_at")? {
+            self.exec("ALTER TABLE sessions ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0;")?;
+        }
+        Ok(())
+    }
+
+    fn column_exists(&self, table: &str, column: &str) -> Result<bool, String> {
+        Ok(self
+            .query(&format!("PRAGMA table_info({table});"))?
+            .into_iter()
+            .any(|row| row.get(1).map(|value| value == column).unwrap_or(false)))
     }
 
     pub fn exec(&self, sql: &str) -> Result<(), String> {

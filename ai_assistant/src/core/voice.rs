@@ -13,7 +13,11 @@ use crate::{
         },
     },
     config::{AppConfig, AssistantPaths, VoiceConfig, resolve_config_path},
-    core::service::run_chat_session,
+    core::{
+        inbound_queue::{InboundRequest, enqueue_request, wait_for_response},
+        service::run_chat_session_with_session,
+        session::Session,
+    },
     util::ensure_dir,
 };
 
@@ -80,6 +84,7 @@ pub fn run_voice_turn(
     let transcriber = SpeechToTextAdapter::new(paths.clone(), config.voice.clone());
     let synthesizer = TextToSpeechAdapter::new(paths.clone(), config.voice.clone());
     let player = AudioPlaybackAdapter::new(config.voice.clone());
+    let voice_session = Session::voice(session, config);
     run_voice_turn_with_adapters(
         paths,
         &config.voice,
@@ -89,8 +94,20 @@ pub fn run_voice_turn(
         &synthesizer,
         &player,
         |message| {
-            run_chat_session(paths, config, store, session, message, config.llm.stream)
-                .map(|output| output.response)
+            if config.messages.queue.enabled {
+                let queued = enqueue_request(
+                    store,
+                    &config.messages.queue,
+                    &InboundRequest {
+                        session: voice_session.clone(),
+                        message_text: message.to_string(),
+                    },
+                )?;
+                wait_for_response(paths, store, config, queued.item_id, 30_000)
+            } else {
+                run_chat_session_with_session(paths, config, store, &voice_session, message, false)
+                    .map(|output| output.response)
+            }
         },
     )
 }

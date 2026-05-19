@@ -1,0 +1,36 @@
+#!/usr/bin/expect -f
+
+set timeout 600
+
+if {$argc < 1} {
+    puts stderr "usage: raspi_ssh_long.exp <remote-command>"
+    exit 2
+}
+
+set password ""
+if {[info exists env(RASPI_PASSWORD)]} {
+    set password $env(RASPI_PASSWORD)
+}
+if {$password eq ""} {
+    stty -echo
+    send_user "Raspberry Pi password: "
+    expect_user -re "(.*)\n"
+    send_user "\n"
+    stty echo
+    set password $expect_out(1,string)
+}
+
+set remote_cmd [lindex $argv 0]
+
+spawn ssh -o StrictHostKeyChecking=accept-new bitlabs@100.64.1.42 $remote_cmd
+expect {
+    -re ".*(P|p)assword:.*" {
+        send "$password\r"
+        exp_continue
+    }
+    timeout {
+        puts stderr "timeout waiting for ssh to finish"
+        exit 124
+    }
+    eof
+}

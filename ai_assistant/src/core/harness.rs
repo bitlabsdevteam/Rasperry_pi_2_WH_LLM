@@ -15,7 +15,9 @@ pub struct HarnessInput {
     pub prefer_code_output: bool,
     pub user_intent: String,
     pub context_snippets: Vec<String>,
-    pub memories: Vec<MemoryRecord>,
+    pub personal_memories: Vec<MemoryRecord>,
+    pub knowledge_memories: Vec<MemoryRecord>,
+    pub runtime_memories: Vec<MemoryRecord>,
     pub tool_context: Vec<String>,
     pub skill_context: Vec<String>,
     pub tasks: Vec<Task>,
@@ -70,9 +72,19 @@ pub fn build_prompt(input: &HarnessInput) -> String {
         prompt.push(format!("Recent context:\n{context}"));
     }
 
-    let memories = build_memory_section(input, available / 4);
-    if !memories.is_empty() {
-        prompt.push(format!("Relevant memory:\n{memories}"));
+    let personal = build_memory_section(&input.personal_memories, available / 6);
+    if !personal.is_empty() {
+        prompt.push(format!("Personal memory:\n{personal}"));
+    }
+
+    let knowledge = build_memory_section(&input.knowledge_memories, available / 6);
+    if !knowledge.is_empty() {
+        prompt.push(format!("Knowledge memory:\n{knowledge}"));
+    }
+
+    let runtime = build_memory_section(&input.runtime_memories, available / 8);
+    if !runtime.is_empty() {
+        prompt.push(format!("Runtime state:\n{runtime}"));
     }
 
     let tasks = build_task_section(input, available / 6);
@@ -124,9 +136,9 @@ fn build_context_section(input: &HarnessInput, budget: usize) -> String {
     lines.join("\n")
 }
 
-fn build_memory_section(input: &HarnessInput, budget: usize) -> String {
+fn build_memory_section(memories: &[MemoryRecord], budget: usize) -> String {
     let mut lines = Vec::new();
-    for memory in &input.memories {
+    for memory in memories {
         let line = format!(
             "- [{}] {} :: {}",
             memory.tags,
@@ -261,7 +273,9 @@ mod tests {
             prefer_code_output: false,
             user_intent: "Plan my day".into(),
             context_snippets: vec!["today is sunny".into()],
-            memories: vec![],
+            personal_memories: vec![],
+            knowledge_memories: vec![],
+            runtime_memories: vec![],
             tool_context: vec!["date".into()],
             skill_context: vec!["daily-notes: append operational notes".into()],
             tasks: vec![Task::new_for_test(1, "Check logs", "pending", 1)],
@@ -287,7 +301,9 @@ mod tests {
             prefer_code_output: false,
             user_intent: "Summarize".into(),
             context_snippets: vec!["x".repeat(400)],
-            memories: vec![],
+            personal_memories: vec![],
+            knowledge_memories: vec![],
+            runtime_memories: vec![],
             tool_context: vec![],
             skill_context: vec![],
             tasks: vec![],
@@ -309,7 +325,9 @@ mod tests {
             prefer_code_output: false,
             user_intent: "hello".into(),
             context_snippets: vec![],
-            memories: vec![],
+            personal_memories: vec![],
+            knowledge_memories: vec![],
+            runtime_memories: vec![],
             tool_context: vec![],
             skill_context: vec![],
             tasks: vec![],
@@ -346,7 +364,9 @@ Preferences:
             prefer_code_output: false,
             user_intent: "Who am I?".into(),
             context_snippets: vec![],
-            memories: vec![],
+            personal_memories: vec![],
+            knowledge_memories: vec![],
+            runtime_memories: vec![],
             tool_context: vec![],
             skill_context: vec![],
             tasks: vec![],
@@ -370,7 +390,9 @@ Preferences:
             prefer_code_output: true,
             user_intent: "Write python code with a for loop".into(),
             context_snippets: vec![],
-            memories: vec![],
+            personal_memories: vec![],
+            knowledge_memories: vec![],
+            runtime_memories: vec![],
             tool_context: vec![],
             skill_context: vec![],
             tasks: vec![],

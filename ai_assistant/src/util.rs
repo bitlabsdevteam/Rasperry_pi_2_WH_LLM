@@ -11,6 +11,13 @@ pub fn now_epoch() -> i64 {
         .unwrap_or(0)
 }
 
+pub fn now_epoch_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 pub fn token_estimate(text: &str) -> usize {
     text.split_whitespace().count().max(1)
 }
@@ -162,6 +169,52 @@ pub fn parse_json_array(contents: &str, key: &str) -> Option<Vec<String>> {
         }
     }
     Some(items)
+}
+
+pub fn parse_json_object(contents: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{key}\"");
+    let start = contents.find(&needle)?;
+    let after_key = &contents[start + needle.len()..];
+    let colon = after_key.find(':')?;
+    let remainder = after_key[colon + 1..].trim_start();
+    let mut chars = remainder.chars();
+    if chars.next()? != '{' {
+        return None;
+    }
+
+    let mut depth = 1usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut end_index = None;
+    for (index, ch) in remainder.char_indices().skip(1) {
+        if in_string {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            match ch {
+                '\\' => escaped = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => in_string = true,
+            '{' => depth += 1,
+            '}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    end_index = Some(index);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    end_index.map(|index| remainder[..=index].to_string())
 }
 
 pub fn path_title(path: &Path) -> String {

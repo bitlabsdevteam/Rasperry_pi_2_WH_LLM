@@ -4,8 +4,8 @@ use std::{
 };
 
 use crate::util::{
-    ensure_dir, parse_json_array, parse_json_bool, parse_json_string, parse_json_usize,
-    read_with_fallback, write_if_missing,
+    ensure_dir, parse_json_array, parse_json_bool, parse_json_object, parse_json_string,
+    parse_json_usize, read_with_fallback, write_if_missing,
 };
 
 const LLM_EXAMPLE: &str = r#"{
@@ -13,14 +13,14 @@ const LLM_EXAMPLE: &str = r#"{
   "endpoint": "http://127.0.0.1:8080/v1/chat/completions",
   "health_endpoint": "http://127.0.0.1:8080/health",
   "model": "smollm2-135m-instruct",
-  "binary_path": "/absolute/path/to/llama-cli",
-  "model_path": "/absolute/path/to/model.gguf",
+  "binary_path": "",
+  "model_path": "",
   "threads": 2,
-  "context_size": 4096,
-  "predict_tokens": 512,
+  "context_size": 2048,
+  "predict_tokens": 192,
   "timeout_secs": 20,
   "retries": 2,
-  "stream": true
+  "stream": false
 }
 "#;
 
@@ -28,7 +28,7 @@ const MEMORY_EXAMPLE: &str = r#"{
   "recent_turn_limit": 8,
   "compact_after_turns": 12,
   "retain_recent_turns": 6,
-  "token_budget": 2048,
+  "token_budget": 768,
   "compact_context_threshold_percent": 70,
   "memory_search_limit": 6,
   "memory_ttl_days": 30
@@ -83,6 +83,23 @@ const VOICE_EXAMPLE: &str = r#"{
   "push_to_talk_command": "",
   "silence_timeout_ms": 1200,
   "temp_audio_dir": "data/voice/tmp"
+}
+"#;
+
+const MESSAGES_EXAMPLE: &str = r#"{
+  "queue": {
+    "enabled": true,
+    "mode": "collect",
+    "global_max_concurrency": 1,
+    "per_session_cap": 5,
+    "telegram_debounce_ms": 1200,
+    "voice_debounce_ms": 300,
+    "drop_policy": "summarize",
+    "lease_timeout_ms": 120000
+  },
+  "reply": {
+    "telegram_chunk_chars": 3000
+  }
 }
 "#;
 
@@ -189,6 +206,10 @@ impl AssistantPaths {
             TELEGRAM_EXAMPLE,
         )?;
         write_if_missing(&self.config_dir.join("voice.example.json"), VOICE_EXAMPLE)?;
+        write_if_missing(
+            &self.config_dir.join("messages.example.json"),
+            MESSAGES_EXAMPLE,
+        )?;
         write_if_missing(&self.profiles_dir.join("assistant.md"), PROFILE_EXAMPLE)?;
         Ok(())
     }
@@ -273,6 +294,29 @@ pub struct VoiceConfig {
 }
 
 #[derive(Clone, Debug)]
+pub struct MessageQueueConfig {
+    pub enabled: bool,
+    pub mode: String,
+    pub global_max_concurrency: usize,
+    pub per_session_cap: usize,
+    pub telegram_debounce_ms: usize,
+    pub voice_debounce_ms: usize,
+    pub drop_policy: String,
+    pub lease_timeout_ms: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct MessageReplyConfig {
+    pub telegram_chunk_chars: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct MessagesConfig {
+    pub queue: MessageQueueConfig,
+    pub reply: MessageReplyConfig,
+}
+
+#[derive(Clone, Debug)]
 pub struct AppConfig {
     pub llm: LlmConfig,
     pub memory: MemoryConfig,
@@ -281,6 +325,7 @@ pub struct AppConfig {
     pub tools: ToolConfig,
     pub telegram: TelegramConfig,
     pub voice: VoiceConfig,
+    pub messages: MessagesConfig,
 }
 
 impl AppConfig {
@@ -314,6 +359,13 @@ impl AppConfig {
             &paths.config_dir.join("voice.json"),
             &paths.config_dir.join("voice.example.json"),
         )?;
+        let messages = read_with_fallback(
+            &paths.config_dir.join("messages.json"),
+            &paths.config_dir.join("messages.example.json"),
+        )?;
+
+        let messages_queue = parse_json_object(&messages, "queue").unwrap_or_else(|| messages.clone());
+        let messages_reply = parse_json_object(&messages, "reply").unwrap_or_else(|| messages.clone());
 
         Ok(Self {
             llm: LlmConfig {
@@ -331,17 +383,17 @@ impl AppConfig {
                     .filter(|value| !value.trim().is_empty())
                     .unwrap_or_else(|| default_llama_model_path(paths)),
                 threads: parse_json_usize(&llm, "threads").unwrap_or(2),
-                context_size: parse_json_usize(&llm, "context_size").unwrap_or(4096),
-                predict_tokens: parse_json_usize(&llm, "predict_tokens").unwrap_or(512),
+                context_size: parse_json_usize(&llm, "context_size").unwrap_or(2048),
+                predict_tokens: parse_json_usize(&llm, "predict_tokens").unwrap_or(192),
                 timeout_secs: parse_json_usize(&llm, "timeout_secs").unwrap_or(20),
                 retries: parse_json_usize(&llm, "retries").unwrap_or(2),
-                stream: parse_json_bool(&llm, "stream").unwrap_or(true),
+                stream: parse_json_bool(&llm, "stream").unwrap_or(false),
             },
             memory: MemoryConfig {
                 recent_turn_limit: parse_json_usize(&memory, "recent_turn_limit").unwrap_or(8),
                 compact_after_turns: parse_json_usize(&memory, "compact_after_turns").unwrap_or(12),
                 retain_recent_turns: parse_json_usize(&memory, "retain_recent_turns").unwrap_or(6),
-                token_budget: parse_json_usize(&memory, "token_budget").unwrap_or(2048),
+                token_budget: parse_json_usize(&memory, "token_budget").unwrap_or(768),
                 compact_context_threshold_percent: parse_json_usize(
                     &memory,
                     "compact_context_threshold_percent",
@@ -411,6 +463,32 @@ impl AppConfig {
                 temp_audio_dir: parse_json_string(&voice, "temp_audio_dir")
                     .unwrap_or_else(|| default_voice_temp_audio_dir(paths)),
             },
+            messages: MessagesConfig {
+                queue: MessageQueueConfig {
+                    enabled: parse_json_bool(&messages_queue, "enabled").unwrap_or(true),
+                    mode: parse_json_string(&messages_queue, "mode")
+                        .unwrap_or_else(|| "collect".to_string()),
+                    global_max_concurrency: parse_json_usize(
+                        &messages_queue,
+                        "global_max_concurrency",
+                    )
+                    .unwrap_or(1),
+                    per_session_cap: parse_json_usize(&messages_queue, "per_session_cap")
+                        .unwrap_or(5),
+                    telegram_debounce_ms: parse_json_usize(&messages_queue, "telegram_debounce_ms")
+                        .unwrap_or(1200),
+                    voice_debounce_ms: parse_json_usize(&messages_queue, "voice_debounce_ms")
+                        .unwrap_or(300),
+                    drop_policy: parse_json_string(&messages_queue, "drop_policy")
+                        .unwrap_or_else(|| "summarize".to_string()),
+                    lease_timeout_ms: parse_json_usize(&messages_queue, "lease_timeout_ms")
+                        .unwrap_or(120_000),
+                },
+                reply: MessageReplyConfig {
+                    telegram_chunk_chars: parse_json_usize(&messages_reply, "telegram_chunk_chars")
+                        .unwrap_or(3000),
+                },
+            },
         })
     }
 }
@@ -425,11 +503,11 @@ impl LlmConfig {
             binary_path: default_llama_binary_path(paths),
             model_path: default_llama_model_path(paths),
             threads: 2,
-            context_size: 4096,
-            predict_tokens: 512,
+            context_size: 2048,
+            predict_tokens: 192,
             timeout_secs: 20,
             retries: 2,
-            stream: true,
+            stream: false,
         }
     }
 }

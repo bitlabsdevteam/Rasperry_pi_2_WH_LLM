@@ -1,13 +1,22 @@
+use std::process::Command;
+
 use crate::{
     adapters::{llama_cpp::LlamaCppAdapter, storage::SqliteStore},
     config::{AppConfig, AssistantPaths},
     core::{
+        actions::{ActionTrace, AssistantAction, MemoryActionScope},
         context::maybe_compact,
         harness::{HarnessInput, build_prompt},
         identity::IdentityProfile,
-        memory::{recent_turns, record_turn, search_memories},
+        memory::{
+            MemoryRecord, collect_memory_context, recent_turns, record_turn,
+            search_memories_in_scope,
+        },
+        session::{
+            AssistantState, Session, infer_task_type, set_session_state, upsert_session,
+        },
         skills::{list_skills, select_skills, skill_prompt_context},
-        tasks::list_tasks,
+        tasks::{add_task, list_tasks},
     },
     util::truncate,
 };
@@ -16,6 +25,8 @@ use crate::{
 pub struct ChatOutput {
     pub response: String,
     pub compaction: Option<String>,
+    pub actions: Vec<AssistantAction>,
+    pub traces: Vec<ActionTrace>,
 }
 
 pub fn run_chat_session(
@@ -26,21 +37,319 @@ pub fn run_chat_session(
     message: &str,
     stream: bool,
 ) -> Result<ChatOutput, String> {
+    let session = session_from_legacy(session, config);
+    run_chat_session_with_session(paths, config, store, &session, message, stream)
+}
+
+pub fn run_chat_session_with_session(
+    paths: &AssistantPaths,
+    config: &AppConfig,
+    store: &SqliteStore,
+    session: &Session,
+    message: &str,
+    stream: bool,
+) -> Result<ChatOutput, String> {
+    let effective_llm = effective_llm_config(&config.llm);
     let identity = IdentityProfile::load(paths, &config.identity)?;
-    let recent = recent_turns(store, session, config.memory.recent_turn_limit)?;
-    let prompt_budget = prompt_budget(config);
-    record_turn(paths, store, session, "user", message)?;
+    let mut session = session.clone();
+    session.model_policy.task = infer_task_type(message, &session.surface);
+    upsert_session(store, &session)?;
+    let _ = set_session_state(store, &session.session_id, AssistantState::Thinking);
+
+    let recent = recent_turns(store, &session.session_id, config.memory.recent_turn_limit)?;
+    let prompt_budget = prompt_budget(config, &effective_llm);
+    record_turn(paths, store, &session.session_id, "user", message)?;
     let selected_skills = select_skills(paths, message, 3)?;
+    let memory_context = collect_memory_context(store, message, config.memory.memory_search_limit)?;
+    let actions = plan_actions(paths, config, store, &session, &identity, message)?;
+    let _ = set_session_state(store, &session.session_id, AssistantState::Acting);
 
-    if let Some(response) = capability_response(paths, config, &identity, message)? {
-        record_turn(paths, store, session, "assistant", &response)?;
-        let compaction = maybe_compact(paths, store, session, &config.memory, &config.llm)?;
-        return Ok(ChatOutput {
-            response,
-            compaction,
-        });
+    let response = execute_actions(
+        paths,
+        config,
+        store,
+        &session,
+        &identity,
+        message,
+        stream,
+        &effective_llm,
+        prompt_budget,
+        &recent,
+        &selected_skills,
+        &memory_context.personal,
+        &memory_context.knowledge,
+        &memory_context.runtime,
+        &actions,
+    )?;
+
+    let _ = set_session_state(store, &session.session_id, AssistantState::Responding);
+    record_turn(paths, store, &session.session_id, "assistant", &response.response)?;
+    let compaction = maybe_compact(
+        paths,
+        store,
+        &session.session_id,
+        &config.memory,
+        &effective_llm,
+    )?;
+    let _ = set_session_state(store, &session.session_id, AssistantState::Idle);
+
+    Ok(ChatOutput {
+        response: response.response,
+        compaction,
+        actions,
+        traces: response.traces,
+    })
+}
+
+#[derive(Clone, Debug)]
+struct ExecutedActions {
+    response: String,
+    traces: Vec<ActionTrace>,
+}
+
+fn session_from_legacy(session_id: &str, config: &AppConfig) -> Session {
+    if let Some(value) = session_id.strip_prefix("telegram:dm:") {
+        if let Ok(user_id) = value.parse::<i64>() {
+            return Session::telegram_dm(user_id, user_id, config);
+        }
     }
+    if session_id.starts_with("voice:") {
+        return Session::voice(session_id, config);
+    }
+    Session::cli(session_id, config)
+}
 
+fn plan_actions(
+    paths: &AssistantPaths,
+    config: &AppConfig,
+    _store: &SqliteStore,
+    session: &Session,
+    identity: &IdentityProfile,
+    message: &str,
+) -> Result<Vec<AssistantAction>, String> {
+    let normalized = message.to_ascii_lowercase();
+    if let Some(response) = deterministic_code_response(&normalized) {
+        return Ok(vec![AssistantAction::ReplyText { text: response }]);
+    }
+    if asks_about_known_user(&normalized) {
+        return Ok(vec![AssistantAction::SearchMemory {
+            scope: MemoryActionScope::Personal,
+            query: message.to_string(),
+        }]);
+    }
+    if asks_for_local_time(&normalized) && session.tool_policy.allows_command("date") {
+        return Ok(vec![AssistantAction::RunTool {
+            command: "date".to_string(),
+            args: vec!["+%Y-%m-%d %H:%M:%S %Z".to_string()],
+            reason: "Provide the current local time/date".to_string(),
+        }]);
+    }
+    if let Some(response) = capability_response(paths, config, identity, message)? {
+        return Ok(vec![AssistantAction::ReplyText { text: response }]);
+    }
+    let _ = (paths, config, _store, session, identity);
+    Ok(vec![AssistantAction::ReplyText {
+        text: "__MODEL_REPLY__".to_string(),
+    }])
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_actions(
+    paths: &AssistantPaths,
+    config: &AppConfig,
+    store: &SqliteStore,
+    session: &Session,
+    identity: &IdentityProfile,
+    message: &str,
+    stream: bool,
+    effective_llm: &crate::config::LlmConfig,
+    prompt_budget: usize,
+    recent: &[crate::core::memory::Message],
+    selected_skills: &[crate::core::skills::Skill],
+    personal_memories: &[MemoryRecord],
+    knowledge_memories: &[MemoryRecord],
+    runtime_memories: &[MemoryRecord],
+    actions: &[AssistantAction],
+) -> Result<ExecutedActions, String> {
+    let mut traces = Vec::new();
+    let mut parts = Vec::new();
+    for action in actions {
+        match action {
+            AssistantAction::ReplyText { text } => {
+                traces.push(ActionTrace::new("reply_text", truncate(text, 96)));
+                if text == "__MODEL_REPLY__" {
+                    parts.push(model_reply_with_context(
+                        paths,
+                        config,
+                        store,
+                        session,
+                        identity,
+                        message,
+                        stream,
+                        effective_llm,
+                        prompt_budget,
+                        recent,
+                        selected_skills,
+                        personal_memories,
+                        knowledge_memories,
+                        runtime_memories,
+                    )?);
+                } else {
+                    parts.push(text.clone());
+                }
+            }
+            AssistantAction::RunTool {
+                command,
+                args,
+                reason,
+            } => {
+                traces.push(ActionTrace::new(
+                    "run_tool",
+                    format!("{} {}", command, args.join(" ")).trim().to_string(),
+                ));
+                parts.push(execute_tool_action(session, command, args, reason)?);
+            }
+            AssistantAction::SearchMemory { scope, query } => {
+                traces.push(ActionTrace::new("search_memory", format!("{}:{query}", scope.as_str())));
+                parts.push(render_memory_action(store, identity, message, scope, query)?);
+            }
+            AssistantAction::AskFollowup { question } => {
+                traces.push(ActionTrace::new("ask_followup", truncate(question, 96)));
+                parts.push(question.clone());
+            }
+            AssistantAction::Defer { notice } => {
+                traces.push(ActionTrace::new("defer", truncate(notice, 96)));
+                parts.push(notice.clone());
+            }
+            AssistantAction::ScheduleTask { title } => {
+                traces.push(ActionTrace::new("schedule_task", truncate(title, 96)));
+                add_task(store, title, 1)?;
+                parts.push(format!("Scheduled task: {title}."));
+            }
+        }
+    }
+    let response = parts
+        .into_iter()
+        .filter(|part| !part.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    Ok(ExecutedActions {
+        response: if response.trim().is_empty() {
+            fallback_response(message)
+        } else {
+            response
+        },
+        traces,
+    })
+}
+
+fn execute_tool_action(
+    session: &Session,
+    command: &str,
+    args: &[String],
+    reason: &str,
+) -> Result<String, String> {
+    if !session.tool_policy.allows_command(command) {
+        return Ok(format!(
+            "I’m not allowed to run `{command}` in this session. {reason} is blocked by policy."
+        ));
+    }
+    let output = Command::new(command)
+        .args(args)
+        .output()
+        .map_err(|error| format!("failed to execute `{command}`: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "command `{command}` failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if command == "date" {
+        Ok(format!("Current local time: {value}"))
+    } else {
+        Ok(value)
+    }
+}
+
+fn render_memory_action(
+    store: &SqliteStore,
+    identity: &IdentityProfile,
+    message: &str,
+    scope: &MemoryActionScope,
+    query: &str,
+) -> Result<String, String> {
+    match scope {
+        MemoryActionScope::Personal => {
+            let facts = identity.known_user_facts();
+            if !facts.is_empty() {
+                return Ok(render_known_user_response(message, &facts));
+            }
+            let matches = search_memories_in_scope(
+                store,
+                query,
+                4,
+                crate::core::memory::MemoryScope::Personal,
+            )?;
+            if matches.is_empty() {
+                Ok("Not yet. I do not have a saved personal profile for this user.".to_string())
+            } else {
+                Ok(render_memory_records("Personal memory", &matches))
+            }
+        }
+        MemoryActionScope::Knowledge => {
+            let matches = search_memories_in_scope(
+                store,
+                query,
+                4,
+                crate::core::memory::MemoryScope::Knowledge,
+            )?;
+            Ok(render_memory_records("Knowledge memory", &matches))
+        }
+        MemoryActionScope::Runtime => {
+            let matches = search_memories_in_scope(
+                store,
+                query,
+                4,
+                crate::core::memory::MemoryScope::Runtime,
+            )?;
+            Ok(render_memory_records("Runtime state", &matches))
+        }
+    }
+}
+
+fn render_memory_records(label: &str, records: &[MemoryRecord]) -> String {
+    if records.is_empty() {
+        return format!("{label}: none");
+    }
+    format!(
+        "{}: {}",
+        label,
+        records
+            .iter()
+            .map(|record| format!("{} :: {}", record.title, record.body))
+            .collect::<Vec<_>>()
+            .join(" | ")
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn model_reply_with_context(
+    _paths: &AssistantPaths,
+    _config: &AppConfig,
+    store: &SqliteStore,
+    session: &Session,
+    identity: &IdentityProfile,
+    message: &str,
+    stream: bool,
+    effective_llm: &crate::config::LlmConfig,
+    prompt_budget: usize,
+    recent: &[crate::core::memory::Message],
+    selected_skills: &[crate::core::skills::Skill],
+    personal_memories: &[MemoryRecord],
+    knowledge_memories: &[MemoryRecord],
+    runtime_memories: &[MemoryRecord],
+) -> Result<String, String> {
     let prompt = build_prompt(&HarnessInput {
         identity_name: identity.name.clone(),
         identity_style: identity.style.clone(),
@@ -49,18 +358,24 @@ pub fn run_chat_session(
         prefer_code_output: asks_for_code_request(message),
         user_intent: message.to_string(),
         context_snippets: vec![
-            format!("session={session}"),
+            format!("session={}", session.session_id),
+            format!("surface={}", session.surface),
+            format!("session_kind={}", session.session_kind.as_str()),
+            format!("reply_policy={}", session.reply_policy.as_str()),
+            format!("model_task={}", session.model_policy.task),
             "runtime=offline-first".to_string(),
-            "execution=deterministic".to_string(),
+            "execution=typed-actions".to_string(),
         ],
-        memories: search_memories(store, message, config.memory.memory_search_limit)?,
-        tool_context: config
-            .tools
-            .allowlist
+        personal_memories: augment_personal_memories(identity, personal_memories),
+        knowledge_memories: knowledge_memories.to_vec(),
+        runtime_memories: build_runtime_memories(session, runtime_memories),
+        tool_context: session
+            .tool_policy
+            .allowlisted_commands
             .iter()
             .map(|tool| format!("allowlisted command: {tool}"))
             .collect(),
-        skill_context: skill_prompt_context(&selected_skills),
+        skill_context: skill_prompt_context(selected_skills),
         tasks: list_tasks(store)?
             .into_iter()
             .filter(|task| task.status != "done")
@@ -69,32 +384,61 @@ pub fn run_chat_session(
         safety_rules: vec![
             "Do not rely on cloud services.".into(),
             "Prefer minimal output on constrained hardware.".into(),
+            "Tool permissions are enforced outside the model.".into(),
             "If llama.cpp is unreachable, return a local degraded response.".into(),
         ],
-        recent_messages: recent,
+        recent_messages: recent.to_vec(),
         token_budget: prompt_budget,
     });
 
-    let adapter = LlamaCppAdapter::new(config.llm.clone());
-    let response = match adapter.infer_chat(&prompt, message, stream) {
+    let adapter = LlamaCppAdapter::new(effective_llm.clone());
+    Ok(match adapter.infer_chat(&prompt, message, stream) {
         Ok(value) => {
             let primary = sanitize_response(&value);
             if is_low_quality_response(message, &primary) {
-                recover_response(&adapter, &identity, message)
+                recover_response(&adapter, identity, message)
             } else {
                 primary
             }
         }
         Err(error) => degraded_response(&error, message),
-    };
-
-    record_turn(paths, store, session, "assistant", &response)?;
-    let compaction = maybe_compact(paths, store, session, &config.memory, &config.llm)?;
-
-    Ok(ChatOutput {
-        response,
-        compaction,
     })
+}
+
+fn augment_personal_memories(
+    identity: &IdentityProfile,
+    personal_memories: &[MemoryRecord],
+) -> Vec<MemoryRecord> {
+    let mut records = personal_memories.to_vec();
+    for fact in identity.known_user_facts() {
+        records.push(MemoryRecord {
+            title: "User profile".to_string(),
+            body: fact,
+            tags: "personal,profile".to_string(),
+        });
+    }
+    records
+}
+
+fn build_runtime_memories(session: &Session, runtime_memories: &[MemoryRecord]) -> Vec<MemoryRecord> {
+    let mut records = runtime_memories.to_vec();
+    records.push(MemoryRecord {
+        title: "Session state".to_string(),
+        body: format!(
+            "surface={} state={} activation={} trusted_tools={}",
+            session.surface,
+            session.state.as_str(),
+            session.activation_mode.as_str(),
+            session.tool_policy.trusted
+        ),
+        tags: "runtime,session,status".to_string(),
+    });
+    records
+}
+
+fn asks_for_local_time(message: &str) -> bool {
+    (message.contains("time") || message.contains("date"))
+        && (message.contains("what") || message.contains("current") || message.contains("today"))
 }
 
 fn capability_response(
@@ -150,13 +494,29 @@ fn capability_response(
     Ok(None)
 }
 
-fn prompt_budget(config: &AppConfig) -> usize {
-    let available = config
-        .llm
+fn effective_llm_config(config: &crate::config::LlmConfig) -> crate::config::LlmConfig {
+    let mut llm = config.clone();
+    llm.context_size = if llm.context_size == 0 {
+        2048
+    } else {
+        llm.context_size.min(2048)
+    };
+    llm.predict_tokens = if llm.predict_tokens == 0 {
+        192
+    } else {
+        llm.predict_tokens.min(192)
+    };
+    llm.stream = false;
+    llm
+}
+
+fn prompt_budget(config: &AppConfig, llm: &crate::config::LlmConfig) -> usize {
+    let available = llm
         .context_size
-        .saturating_sub(config.llm.predict_tokens)
+        .saturating_sub(llm.predict_tokens)
         .saturating_sub(96);
-    config.memory.token_budget.min(available.max(128))
+    let capped_memory_budget = config.memory.token_budget.min(768);
+    capped_memory_budget.min(available.max(128))
 }
 
 fn degraded_response(error: &str, message: &str) -> String {
@@ -251,6 +611,9 @@ fn recover_response(
     identity: &IdentityProfile,
     message: &str,
 ) -> String {
+    if let Some(response) = deterministic_code_response(&message.to_ascii_lowercase()) {
+        return response;
+    }
     if let Some(response) = deterministic_response(message) {
         return response;
     }
@@ -274,6 +637,12 @@ fn recover_response(
         let cleaned = sanitize_response(&value);
         if !is_low_quality_response(message, &cleaned) {
             return cleaned;
+        }
+    }
+
+    if asks_for_code_request(message) {
+        if let Some(response) = generic_loop_fallback(&message.to_ascii_lowercase()) {
+            return response;
         }
     }
 
@@ -549,6 +918,30 @@ fn deterministic_code_response(message: &str) -> Option<String> {
     if (message.contains("python") || message.contains("py")) && message.contains("for loop") {
         return Some("```python\nfor i in range(5):\n    print(i)\n```".to_string());
     }
+    if (message.contains("typescript") || message.contains("ts"))
+        && message.contains("for loop")
+    {
+        return Some("```typescript\nfor (let i = 0; i < 5; i += 1) {\n  console.log(i);\n}\n```".to_string());
+    }
+    generic_loop_fallback(message)
+}
+
+fn generic_loop_fallback(message: &str) -> Option<String> {
+    if !message.contains("for loop") {
+        return None;
+    }
+    if message.contains("javascript") {
+        return Some(
+            "```javascript\nfor (let i = 0; i < 5; i += 1) {\n  console.log(i);\n}\n```"
+                .to_string(),
+        );
+    }
+    if message.contains("rust") {
+        return Some("```rust\nfor i in 0..5 {\n    println!(\"{}\", i);\n}\n```".to_string());
+    }
+    if message.contains("java") {
+        return Some("```java\nfor (int i = 0; i < 5; i++) {\n    System.out.println(i);\n}\n```".to_string());
+    }
     None
 }
 
@@ -779,16 +1172,18 @@ mod tests {
     use std::path::PathBuf;
 
     use crate::config::{
-        AppConfig, AssistantPaths, IdentityConfig, LlmConfig, MemoryConfig, SchedulerConfig,
-        TelegramConfig, ToolConfig, VoiceConfig, default_voice_stt_model_path,
-        default_voice_temp_audio_dir, default_voice_tts_model_path,
+        AppConfig, AssistantPaths, IdentityConfig, LlmConfig, MemoryConfig, MessageQueueConfig,
+        MessageReplyConfig, MessagesConfig, SchedulerConfig, TelegramConfig, ToolConfig,
+        VoiceConfig, default_voice_stt_model_path, default_voice_temp_audio_dir,
+        default_voice_tts_model_path,
     };
     use crate::core::identity::IdentityProfile;
     use crate::util::unique_temp_dir;
 
     use super::{
         asks_about_ml_ai, capability_response, collapse_repetition, degraded_response,
-        deterministic_response, is_low_quality_response, prompt_budget, sanitize_response,
+        deterministic_response, effective_llm_config, is_low_quality_response, prompt_budget,
+        sanitize_response,
     };
 
     #[test]
@@ -856,8 +1251,9 @@ mod tests {
                 api_base_url: "https://api.telegram.org".into(),
             },
             voice: voice_config_for_tests(&AssistantPaths::new(PathBuf::from("/tmp"))),
+            messages: messages_config(),
         };
-        assert_eq!(prompt_budget(&config), 128);
+        assert_eq!(prompt_budget(&config, &effective_llm_config(&config.llm)), 128);
     }
 
     #[test]
@@ -1000,6 +1396,7 @@ mod tests {
                     api_base_url: "https://api.telegram.org".into(),
                 },
                 voice: voice_config_for_tests(&AssistantPaths::new(PathBuf::from("/tmp"))),
+                messages: messages_config(),
             },
             &IdentityProfile {
                 name: "Kumo".into(),
@@ -1028,6 +1425,14 @@ mod tests {
         assert_eq!(
             deterministic_response("create me a python code with a for loop").unwrap(),
             "```python\nfor i in range(5):\n    print(i)\n```"
+        );
+    }
+
+    #[test]
+    fn deterministic_response_handles_typescript_for_loop_request() {
+        assert_eq!(
+            deterministic_response("I need a for loop code in typescript").unwrap(),
+            "```typescript\nfor (let i = 0; i < 5; i += 1) {\n  console.log(i);\n}\n```"
         );
     }
 
@@ -1180,6 +1585,25 @@ Preferences:
                 api_base_url: "https://api.telegram.org".into(),
             },
             voice: voice_config_for_tests(&AssistantPaths::new(PathBuf::from("/tmp"))),
+            messages: messages_config(),
+        }
+    }
+
+    fn messages_config() -> MessagesConfig {
+        MessagesConfig {
+            queue: MessageQueueConfig {
+                enabled: true,
+                mode: "collect".into(),
+                global_max_concurrency: 1,
+                per_session_cap: 5,
+                telegram_debounce_ms: 1200,
+                voice_debounce_ms: 300,
+                drop_policy: "summarize".into(),
+                lease_timeout_ms: 120_000,
+            },
+            reply: MessageReplyConfig {
+                telegram_chunk_chars: 3000,
+            },
         }
     }
 

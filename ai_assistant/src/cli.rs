@@ -16,9 +16,11 @@ use crate::{
     },
     core::{
         identity::{UserProfile, write_assistant_profile},
+        inbound_queue::dispatch_due_once,
         memory::{search_memories, summarize_session},
         rag,
         scheduler::{add_job, list_jobs, run_due_jobs},
+        session::{fetch_session, list_sessions},
         service::run_chat_session,
         skills::{create_skill, install_skill_file, list_skills, run_skill},
         tasks::{add_task, complete_task, list_tasks, update_task},
@@ -83,7 +85,9 @@ pub fn run(args: Vec<String>, paths: AssistantPaths) -> Result<String, String> {
         "serve" => run_serve(&args[2..], &paths, &store, &config, &tools),
         "telegram" => run_telegram_command(&args[2..], &paths, &store, &config),
         "voice" => run_voice_command(&args[2..], &paths, &store, &config),
-        "doctor" => run_doctor(&paths, &config),
+        "session" => run_session_command(&args[2..], &store),
+        "queue" => run_queue_command(&args[2..], &store),
+        "doctor" => run_doctor(&paths, &config, &store),
         "onboard" => run_onboard(&args[2..], &paths),
         "help" | "--help" | "-h" => render_help_text(&paths, &config, &store),
         other => Err(format!(
@@ -536,12 +540,14 @@ fn run_serve(
             next_scheduler_tick = Instant::now() + scheduler_interval;
         }
 
+        logs.extend(dispatch_due_once(paths, store, config)?);
         logs.extend(process_telegram_once(
             paths,
             store,
             config,
             service_telegram_timeout(config, Instant::now(), next_scheduler_tick),
         )?);
+        logs.extend(dispatch_due_once(paths, store, config)?);
         if !logs.is_empty() {
             println!("{}", logs.join("\n"));
         }
@@ -765,7 +771,137 @@ fn render_voice_doctor(paths: &AssistantPaths, config: &AppConfig) -> String {
     lines.join("\n")
 }
 
-fn run_doctor(paths: &AssistantPaths, config: &AppConfig) -> Result<String, String> {
+fn run_session_command(args: &[String], store: &SqliteStore) -> Result<String, String> {
+    match args.first().map(String::as_str) {
+        Some("list") | None => {
+            let sessions = list_sessions(store)?;
+            if sessions.is_empty() {
+                return Ok("no sessions recorded".to_string());
+            }
+            Ok(sessions
+                .into_iter()
+                .map(|item| {
+                    format!(
+                        "{} :: surface={} kind={} state={} reply={} updated={}",
+                        item.session.session_id,
+                        item.session.surface,
+                        item.session.session_kind.as_str(),
+                        item.session.state.as_str(),
+                        item.session.reply_policy.as_str(),
+                        item.updated_at
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n"))
+        }
+        Some("show") => {
+            let session_id = args
+                .get(1)
+                .ok_or_else(|| "session show requires a session id".to_string())?;
+            let item = fetch_session(store, session_id)?
+                .ok_or_else(|| format!("unknown session `{session_id}`"))?;
+            Ok(format!(
+                concat!(
+                    "session_id: {}\n",
+                    "surface: {}\n",
+                    "peer_id: {}\n",
+                    "chat_id: {}\n",
+                    "kind: {}\n",
+                    "activation: {}\n",
+                    "reply_policy: {}\n",
+                    "state: {}\n",
+                    "tool_policy: trusted={} memory_write={} commands={}\n",
+                    "model_policy: task={} fallback={} degraded={}\n",
+                    "last_message_at: {}\n",
+                    "updated_at: {}"
+                ),
+                item.session.session_id,
+                item.session.surface,
+                empty_as_default(item.session.peer_id.as_deref().unwrap_or_default()),
+                empty_as_default(item.session.chat_id.as_deref().unwrap_or_default()),
+                item.session.session_kind.as_str(),
+                item.session.activation_mode.as_str(),
+                item.session.reply_policy.as_str(),
+                item.session.state.as_str(),
+                item.session.tool_policy.trusted,
+                item.session.tool_policy.allow_memory_write,
+                if item.session.tool_policy.allowlisted_commands.is_empty() {
+                    "none".to_string()
+                } else {
+                    item.session.tool_policy.allowlisted_commands.join(", ")
+                },
+                item.session.model_policy.task,
+                if item.session.model_policy.fallback_order.is_empty() {
+                    "none".to_string()
+                } else {
+                    item.session.model_policy.fallback_order.join(", ")
+                },
+                item.session.model_policy.allow_degraded_fallback,
+                item.last_message_at
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "none".to_string()),
+                item.updated_at
+            ))
+        }
+        _ => Err("session supports: list | show <session-id>".to_string()),
+    }
+}
+
+fn run_queue_command(args: &[String], store: &SqliteStore) -> Result<String, String> {
+    match args.first().map(String::as_str) {
+        Some("status") | None => {
+            let queued = queue_status_count(store, "queued")?;
+            let running = queue_status_count(store, "running")?;
+            let done = queue_status_count(store, "done")?;
+            let failed = queue_status_count(store, "failed")?;
+            let dropped = queue_status_count(store, "dropped")?;
+            let leases = store
+                .scalar("SELECT COUNT(*) FROM inbound_queue_leases;")?
+                .unwrap_or_else(|| "0".to_string());
+            Ok(format!(
+                "queue queued={} running={} done={} failed={} dropped={} active_leases={}",
+                queued, running, done, failed, dropped, leases
+            ))
+        }
+        Some("show") => {
+            let rows = store.query(
+                "SELECT id, surface, session_id, status, created_at, available_at,
+                        COALESCE(started_at, ''), COALESCE(finished_at, ''),
+                        merged_count, substr(replace(message_text, char(10), ' '), 1, 120)
+                 FROM inbound_queue
+                 ORDER BY created_at DESC
+                 LIMIT 20;",
+            )?;
+            if rows.is_empty() {
+                return Ok("queue is empty".to_string());
+            }
+            Ok(rows
+                .into_iter()
+                .filter(|row| row.len() >= 10)
+                .map(|row| {
+                    format!(
+                        "#{} [{} {}] {} :: created={} available={} started={} finished={} merged={} :: {}",
+                        row[0], row[1], row[3], row[2], row[4], row[5], empty_as_default(&row[6]),
+                        empty_as_default(&row[7]), row[8], row[9]
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n"))
+        }
+        _ => Err("queue supports: status | show".to_string()),
+    }
+}
+
+fn queue_status_count(store: &SqliteStore, status: &str) -> Result<String, String> {
+    store
+        .scalar(&format!(
+            "SELECT COUNT(*) FROM inbound_queue WHERE status = '{}';",
+            status
+        ))
+        .map(|value| value.unwrap_or_else(|| "0".to_string()))
+}
+
+fn run_doctor(paths: &AssistantPaths, config: &AppConfig, store: &SqliteStore) -> Result<String, String> {
     let mut lines = vec!["Doctor report".to_string()];
     lines.push(check_line("config/", writable_dir(&paths.config_dir)));
     lines.push(check_line("data/", writable_dir(&paths.data_dir)));
@@ -779,6 +915,37 @@ fn run_doctor(paths: &AssistantPaths, config: &AppConfig) -> Result<String, Stri
         "GGUF model path",
         Path::new(&config.llm.model_path).exists(),
     ));
+    lines.push(format!(
+        "effective llm context/predict: {}/{}",
+        if config.llm.context_size == 0 {
+            2048
+        } else {
+            config.llm.context_size.min(2048)
+        },
+        if config.llm.predict_tokens == 0 {
+            192
+        } else {
+            config.llm.predict_tokens.min(192)
+        }
+    ));
+    lines.push(format!(
+        "queue enabled/mode: {}/{}",
+        config.messages.queue.enabled, config.messages.queue.mode
+    ));
+    lines.push(format!(
+        "queue caps: global={} per-session={}",
+        config.messages.queue.global_max_concurrency,
+        config.messages.queue.per_session_cap
+    ));
+    lines.push(format!(
+        "telegram reply chunk chars: {}",
+        config.messages.reply.telegram_chunk_chars
+    ));
+    lines.push(format!(
+        "session count: {}",
+        list_sessions(store)?.len()
+    ));
+    lines.push(format!("queue health: {}", run_queue_command(&["status".into()], store)?));
 
     lines.push(String::new());
     lines.push(render_voice_doctor(paths, config));
@@ -1021,6 +1188,8 @@ fn render_help_text(
         "assistant onboard telegram".to_string(),
         "assistant doctor".to_string(),
         "assistant telegram status".to_string(),
+        "assistant session list".to_string(),
+        "assistant queue status".to_string(),
         "assistant voice doctor".to_string(),
         "assistant voice run --once".to_string(),
         String::new(),
@@ -1033,6 +1202,10 @@ fn render_help_text(
         "assistant telegram pending".to_string(),
         "assistant telegram approve <code>".to_string(),
         "assistant telegram deny <code>".to_string(),
+        "assistant session list".to_string(),
+        "assistant session show <session-id>".to_string(),
+        "assistant queue status".to_string(),
+        "assistant queue show".to_string(),
         "assistant voice run --once [--session <id>]".to_string(),
         "assistant voice serve [--session <id>] [--iterations N]".to_string(),
         "assistant voice doctor".to_string(),
@@ -1099,6 +1272,17 @@ fn resolve_local_llm_config(paths: &AssistantPaths, current: &LlmConfig) -> LlmC
     if config.health_endpoint.trim().is_empty() {
         config.health_endpoint = "http://127.0.0.1:8080/health".to_string();
     }
+    config.context_size = if config.context_size == 0 {
+        2048
+    } else {
+        config.context_size.min(2048)
+    };
+    config.predict_tokens = if config.predict_tokens == 0 {
+        192
+    } else {
+        config.predict_tokens.min(192)
+    };
+    config.stream = false;
     config
 }
 
@@ -1133,12 +1317,14 @@ fn run_service_tick(
     telegram_timeout: Option<usize>,
 ) -> Result<Vec<String>, String> {
     let mut logs = run_due_jobs(paths, store, &config.scheduler, tools)?;
+    logs.extend(dispatch_due_once(paths, store, config)?);
     logs.extend(process_telegram_once(
         paths,
         store,
         config,
         telegram_timeout,
     )?);
+    logs.extend(dispatch_due_once(paths, store, config)?);
     Ok(logs)
 }
 
@@ -1814,7 +2000,8 @@ mod tests {
         )
         .unwrap();
         assert!(output.contains("job-one"));
-        assert!(output.contains("replied to"));
+        assert!(output.contains("queued Telegram message"));
+        assert!(output.contains("delivered queued telegram reply"));
         assert_eq!(
             crate::core::memory::recent_turns(&store, "telegram:dm:42", 4)
                 .unwrap()
@@ -1900,7 +2087,8 @@ mod tests {
             paths.clone(),
         )
         .unwrap();
-        assert!(output.contains("replied to"));
+        assert!(output.contains("queued Telegram message"));
+        assert!(output.contains("delivered queued telegram reply"));
 
         server.join().unwrap();
         let requests = requests.lock().unwrap().clone();
